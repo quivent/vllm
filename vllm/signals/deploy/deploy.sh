@@ -98,10 +98,26 @@ export PATH="$HOME/.local/bin:$PATH"
 [[ -d .venv ]] || uv venv --python 3.12
 export PATH="$REPO/.venv/bin:$PATH"
 
+SHA="$(git rev-parse --short=12 HEAD)"
+WHEEL_KEY="artifacts/vllm-wheels/$SHA/$(uname -m)"
 if ! .venv/bin/python -c "import vllm, torch" 2>/dev/null; then
-  # The precompiled variant must match this commit's CUDA (13.0). Auto-detection
-  # probes for a cu129 build that is not published, so pin it.
-  VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 uv pip install -e .
+  # Prefer a wheel already built for this exact commit and host architecture:
+  # it pins the artifact rather than re-resolving against wheels.vllm.ai, and
+  # skips the build entirely. Wheels are per-arch -- an aarch64 build is no use
+  # on an x86_64 host, so the key carries `uname -m`.
+  mkdir -p dist
+  if command -v gemstone >/dev/null && gemstone store pull "$WHEEL_KEY/" dist 2>/dev/null \
+     && compgen -G "dist/*.whl" >/dev/null; then
+    echo "  installing the cached wheel for $SHA ($(uname -m))"
+    uv pip install dist/*.whl
+    PREBUILT=1
+  else
+    echo "  no cached wheel for $SHA/$(uname -m); building"
+    # The precompiled variant must match this commit's CUDA (13.0). Auto-detection
+    # probes for a cu129 build that is not published, so pin it.
+    VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 uv pip install -e .
+    PREBUILT=0
+  fi
 fi
 uv pip install ninja >/dev/null 2>&1 || true   # flashinfer JITs at startup
 .venv/bin/python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable'; print('  torch', torch.__version__, torch.cuda.get_device_name(0))"
@@ -159,14 +175,20 @@ PY
   fi
 }
 
+# The bucket holds models content-addressed (blobs/refs/trees), which is not a
+# servable directory, so acquire through gemstone's model control plane, which
+# materializes an exact revision and registers its placement.
 MODEL_DIR="$MODELS/RedHatAI/Qwen3.8-27B-INT4"
-if [[ ! -f "$MODEL_DIR/config.json" ]]; then
-  echo "  pulling the model (~19 GB)"
-  mkdir -p "$MODEL_DIR"
-  r2_pull models/RedHatAI/Qwen3.8-27B-INT4/ "$MODEL_DIR"
-else
+if [[ -f "$MODEL_DIR/config.json" ]]; then
   echo "  model already present"
+elif command -v gemstone >/dev/null; then
+  echo "  materializing the model (~19 GB)"
+  gemstone models download --local-dir "$MODEL_DIR" \
+    || die "gemstone models download failed; materialize $MODEL_DIR by hand"
+else
+  die "no gemstone: materialize $MODEL_DIR (RedHatAI/Qwen3.8-27B-INT4) by hand"
 fi
+[[ -f "$MODEL_DIR/config.json" ]] || die "$MODEL_DIR has no config.json"
 
 # The compile cache is keyed by GPU arch and by the CUDA/torch build. A miss
 # only costs a recompile, so a wrong or absent cache is never fatal.
@@ -175,6 +197,18 @@ mkdir -p "$VLLM_CACHE_ROOT"
 r2_pull "artifacts/vllm-compile-cache/$ARCH_TAG/" "$VLLM_CACHE_ROOT" 2>/dev/null \
   && echo "  compile cache restored ($ARCH_TAG)" \
   || echo "  no compile cache for $ARCH_TAG - first boot will compile (~35 s)"
+
+# Publish the wheel so the next box of this architecture skips the build.
+if [[ "${PREBUILT:-1}" == "0" && "$R2_MODE" == "gemstone" ]]; then
+  if compgen -G "$REPO/dist/*.whl" >/dev/null \
+     || VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
+        uv build --wheel --out-dir "$REPO/dist" >/dev/null 2>&1; then
+    for w in "$REPO"/dist/*.whl; do
+      gemstone store push "$w" "$WHEEL_KEY/$(basename "$w")" >/dev/null 2>&1 \
+        && echo "  published $(basename "$w") to $WHEEL_KEY/"
+    done
+  fi
+fi
 
 mkdir -p "$SIGNALS"
 if (( PULL_SIGNALS )); then

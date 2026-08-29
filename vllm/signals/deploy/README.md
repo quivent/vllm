@@ -4,12 +4,23 @@ What transfers from the GH200 build, what does not, and what to pull from R2.
 
 ## What does not transfer
 
-**The wheel.** The artifact built on the GH200 is
+**The wheel, across architectures.** The artifact built on the GH200 is
 `vllm-…-cp312-cp312-linux_aarch64.whl`. H100 and H200 boards sit in **x86_64**
 hosts, so that wheel is unusable there — the GPU is the same Hopper `sm_90`, but
-the *host* architecture is not. Build again on the target with
-`VLLM_USE_PRECOMPILED=1`; vLLM publishes an x86_64 wheel for the same commit, so
-this is a download, not a compile.
+the *host* architecture is not.
+
+Wheels *are* cached in R2, keyed by commit and host architecture:
+
+```
+artifacts/vllm-wheels/<git-sha>/<uname -m>/vllm-….whl
+```
+
+The script pulls a matching wheel when one exists and installs that, which pins
+the exact artifact instead of re-resolving against `wheels.vllm.ai` — and after
+a build on a new architecture it publishes the result, so the next box of that
+kind skips the build. A cached wheel gives a non-editable install: right for a
+deployment, wrong for development, where you want `pip install -e .` so repo
+edits take effect.
 
 **The CUDA forward-compat shim.** The GH200 needed
 `cuda-compat-13-0_…_arm64.deb` from the **sbsa** repo. On x86_64 the equivalent
@@ -20,10 +31,16 @@ the CUDA this vLLM was built against — see below.
 
 | R2 prefix | what | why pull it |
 |---|---|---|
-| `models/RedHatAI/Qwen3.8-27B-INT4/` | the model, ~19 GB | avoids a HuggingFace pull |
+| `artifacts/vllm-wheels/<sha>/<arch>/` | the built wheel | pins the artifact, skips the build |
 | `artifacts/vllm-compile-cache/<arch>/` | torch.compile artifacts | skips ~35 s of compile per boot |
 | `signals/<model>/<session>/<day>/` | captured residuals | the corpus, for building injection vectors |
 | `signals/_catalog/*.jsonl` | the catalog | query the corpus without listing it |
+
+The model is **not** pulled from `models/` as a prefix: the bucket stores it
+content-addressed (`blobs/refs/trees`), which is not a servable directory —
+pulling it yields 19 GB with no `config.json`. Acquire it through
+`gemstone models download --local-dir`, which materializes an exact revision and
+registers the placement.
 
 The compile cache is keyed by GPU arch — `h100-sm90a` already exists. H100,
 H200 and GH200 are all `sm_90`, but the cache also keys on the CUDA and torch

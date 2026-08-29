@@ -181,7 +181,22 @@ into a startup, as something that looks unrelated.
 
 1. **Fix the bench spec detector** (§5). A verification tool that lies about one
    field undermines the eleven it gets right.
-2. **Try injection on a real model.** It is unit-tested and has never touched a
+2. **Injection as built is a graft, not a starting state — this is the gap.**
+   `mode=replace` swaps layer 63's output while layers 0-62 still computed from
+   the real prompt. The first token is coherent (final norm and lm_head see the
+   injected vector) but **the KV cache for that position was written by the real
+   computation at every layer**, so every later token attends to the original
+   state, not the injected one. The generation drifts back.
+
+   What is actually wanted is the residual as a genuine *starting state*: the
+   model begins from it and everything downstream is consistent. That needs the
+   KV cache to agree with the injected state, not just one layer's output. It is
+   a deeper change than what is here, and nobody has designed it yet.
+
+   Treat the current `add`/`replace` as activation *steering* - useful for
+   nudging along a contrast direction (`build diff`), not for resuming a state.
+
+3. **Try the existing injection on a real model anyway.** It is unit-tested and has never touched a
    GPU. `POST /signals/inject` with a sample from `samples/`.
 4. **Materialize the R2 model copy** (§5) so provisioning stops depending on HF.
 5. Then, if wanted: capture the MTP drafter's own residual (its

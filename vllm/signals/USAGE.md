@@ -163,6 +163,17 @@ cleared. **Injection is unit-tested but has never been run against a real
 model** — treat the first results with suspicion, and sanity-check that `alpha:
 0` behaves identically to no injection.
 
+### What this is not
+
+This grafts a vector into one layer's output; it does **not** start the model
+from that state. Layers below still computed from the real prompt, and the KV
+cache for that position was written by that real computation - so later tokens
+attend to the original state and the generation drifts back toward it.
+
+Use it as steering along a direction (`build diff`), not as state resumption.
+Resuming from a captured state coherently would need the KV cache to agree with
+the injected residual, which is not built.
+
 ### A caution
 
 A residual only means the same thing at the layer and model it came from.

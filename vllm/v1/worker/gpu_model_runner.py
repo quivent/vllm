@@ -5461,9 +5461,7 @@ class GPUModelRunner(
                     self.signal_capturer.check_graph_backend(
                         self.get_model(), self.use_aux_hidden_state_outputs
                     )
-                    self.model.set_aux_hidden_state_layers(
-                        self.signal_capturer.graph_aux_layers()
-                    )
+                    self.signal_capturer.enable_graph_aux(self.get_model())
                     self.use_aux_hidden_state_outputs = True
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.

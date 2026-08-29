@@ -75,6 +75,24 @@ def _first_tensor(value) -> torch.Tensor | None:
     return None
 
 
+def find_aux_holder(model: nn.Module, layers: list[nn.Module]) -> nn.Module | None:
+    """The EagleModelMixin that owns ``layers``.
+
+    Multimodal wrappers reach the decoder through varying attribute paths, and
+    `set_aux_hidden_state_layers` unwraps by convention, so it can silently set
+    the flag on the wrong object. Matching on the layer stack we actually tapped
+    finds the right holder whatever the wrapper looks like.
+    """
+    from vllm.model_executor.models.interfaces import EagleModelMixin
+
+    for module in model.modules():
+        if isinstance(module, EagleModelMixin):
+            owned = getattr(module, "layers", None)
+            if owned is not None and len(owned) and owned[0] is layers[0]:
+                return module
+    return None
+
+
 def find_decoder_layers(model: nn.Module) -> list[nn.Module]:
     """Locate the decoder layer stack, without depending on a model class.
 
@@ -647,7 +665,8 @@ class SignalCapturer:
                 f"{self.max_tier.wire_name!r} asks for scalar reductions. Use "
                 "residual_raw, or the hook backend."
             )
-        if not supports_eagle3(model):
+        holder = find_aux_holder(model, self.layers)
+        if holder is None and not supports_eagle3(model):
             raise ValueError(
                 "--signal-capture-backend graph needs a model implementing the "
                 "EAGLE-3 interface (it reuses that mechanism's auxiliary hidden "
@@ -679,6 +698,32 @@ class SignalCapturer:
             f"{','.join(str(i - 1) for i in sorted(published))}), or use "
             "--signal-capture-backend hook."
         )
+
+    def enable_graph_aux(self, model: nn.Module) -> None:
+        """Ask the model to emit the residuals, and check that it agreed.
+
+        Raises:
+            RuntimeError: if the request did not reach the decoder stack, which
+                would otherwise surface much later as an opaque assertion when
+                the model returns a bare tensor.
+        """
+        wanted = self.graph_aux_layers()
+        holder = find_aux_holder(model, self.layers)
+        if holder is not None:
+            holder._set_aux_hidden_state_layers(wanted)
+        else:
+            model.set_aux_hidden_state_layers(wanted)
+            holder = find_aux_holder(model, self.layers)
+
+        got = tuple(getattr(holder, "aux_hidden_state_layers", ())) if holder else ()
+        if got != wanted:
+            raise RuntimeError(
+                "Signal capture: the graph backend asked this model for "
+                f"auxiliary hidden states at {wanted} but the decoder stack "
+                f"reports {got or '()'}. Its wrapper does not route "
+                "set_aux_hidden_state_layers to the stack that runs. Use "
+                "--signal-capture-backend hook."
+            )
 
     def observe_aux(self, aux_hidden_states) -> None:
         """Take the residuals the model returned, in graph-backend mode.

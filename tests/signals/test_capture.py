@@ -384,3 +384,37 @@ def test_mismatched_row_mapping_skips_the_step(tmp_path, caplog):
     capturer.shutdown()
 
     assert not list(tmp_path.glob("*.safetensors"))
+
+
+def test_shutdown_flushes_requests_that_never_got_a_final_step(tmp_path):
+    """A request finishing on the last engine step still gets its deposit.
+
+    `finish_requests` is driven by the scheduler's finished-id set, which only
+    arrives on a *subsequent* step. Requests that finish last never see one, so
+    shutdown is their only flush.
+    """
+    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+
+    run_steps(capturer, model, ["never-reported"], n_steps=3)
+    assert not list(tmp_path.glob("*.safetensors"))
+
+    capturer.shutdown()
+
+    _, header = read_deposit(tmp_path / "never-reported.safetensors")
+    assert header["residual"]["shape"] == [3, HIDDEN]
+
+
+def test_shutdown_is_idempotent(tmp_path):
+    """The exit backstop may fire after an explicit shutdown; that must be safe."""
+    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+    run_steps(capturer, model, ["r"], n_steps=2)
+
+    capturer.shutdown()
+    capturer.shutdown()
+
+    _, header = read_deposit(tmp_path / "r.safetensors")
+    assert header["residual"]["shape"] == [2, HIDDEN]

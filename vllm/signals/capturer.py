@@ -29,9 +29,11 @@ attention kernel; the T6 tier is rejected at startup rather than silently
 recording nothing.
 """
 
+import atexit
 import os
 import re
 import threading
+import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -145,6 +147,7 @@ class SignalCapturer:
 
         if self.enabled:
             self._install_hooks()
+            self._register_exit_flush()
             logger.info(
                 "Signal capture active: tier=%s layers=%s (of %d) token_step=%d "
                 "dtype=%s -> %s",
@@ -432,6 +435,21 @@ class SignalCapturer:
             )
             self._deposits[request_id] = deposit
         return deposit
+
+    def _register_exit_flush(self) -> None:
+        """Last-resort flush, in case the runner is torn down without shutdown().
+
+        Holds only a weak reference, so registering here never keeps the model
+        alive past its natural lifetime.
+        """
+        ref = weakref.ref(self)
+
+        def flush_on_exit() -> None:
+            capturer = ref()
+            if capturer is not None:
+                capturer.shutdown()
+
+        atexit.register(flush_on_exit)
 
     def finish_requests(self, request_ids) -> None:
         """Write and retire the deposits for finished requests."""

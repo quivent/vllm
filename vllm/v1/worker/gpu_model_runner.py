@@ -6655,6 +6655,12 @@ class GPUModelRunner(
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if self.signal_capturer is not None:
+            # Flush deposits for requests still in flight. Requests that finish
+            # on the very last engine step are never reported through a
+            # subsequent scheduler output, so this is their only flush.
+            self.signal_capturer.shutdown()
+            self.signal_capturer = None
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 

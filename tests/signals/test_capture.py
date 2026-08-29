@@ -306,3 +306,81 @@ def test_hooks_are_inert_outside_a_step(tmp_path):
 def test_layer_selector(spec, expected):
     config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, layers=spec)
     assert config.resolve_layers(N_LAYERS) == expected
+
+
+def test_residual_matches_vllms_own_aux_hidden_state():
+    """The residual tap must equal what EAGLE-3's aux hidden state hook records.
+
+    Both are meant to be the residual stream out of a layer; pinning them
+    together keeps the deposit honest if either definition ever moves.
+    """
+    from vllm.model_executor.models.interfaces import EagleModelMixin
+
+    mixin = EagleModelMixin()
+    mixin._set_aux_hidden_state_layers((1,))
+    hidden, residual = torch.randn(4, HIDDEN), torch.randn(4, HIDDEN)
+    (expected,) = mixin._maybe_add_hidden_state([], 1, hidden, residual)
+
+    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir="")
+    capturer = SignalCapturer(config, FakeModel())
+    captured = {}
+    capturer._stage = lambda signal, idx, tensor: captured.setdefault(signal, tensor)
+    capturer._active = True
+    capturer._make_residual_hook(0)(None, None, (hidden, residual))
+
+    torch.testing.assert_close(captured["residual"], expected)
+
+
+def test_residual_tap_handles_a_layer_without_a_fused_residual():
+    """Models whose layers return a bare tensor still record the stream."""
+    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir="")
+    capturer = SignalCapturer(config, FakeModel())
+    captured = {}
+    capturer._stage = lambda signal, idx, tensor: captured.setdefault(signal, tensor)
+    capturer._active = True
+
+    stream = torch.randn(4, HIDDEN)
+    capturer._make_residual_hook(0)(None, None, stream)
+    torch.testing.assert_close(captured["residual"], stream)
+
+
+def test_decoder_stack_discovery_ignores_a_drafter_stack():
+    """A speculator's layers must not be mistaken for the target's."""
+
+    class WithDrafter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeInner()
+            self.drafter = nn.Module()
+            self.drafter.layers = nn.ModuleList(FakeLayer() for _ in range(2))
+
+    layers = find_decoder_layers(WithDrafter())
+    assert len(layers) == N_LAYERS
+
+
+def test_spec_decode_rows_map_to_the_right_requests():
+    """One request owns as many rows as it had draft positions verified."""
+    from vllm.signals.capturer import counts_from_cumulative, rows_to_request_ids
+
+    assert rows_to_request_ids(["a", "b"], [3, 1]) == ["a", "a", "a", "b"]
+    assert rows_to_request_ids(["a", "b"], None) == ["a", "b"]
+    # A mismatched count array is ignored rather than misattributing rows.
+    assert rows_to_request_ids(["a", "b"], [3]) == ["a", "b"]
+    assert counts_from_cumulative([0, 3, 4], 2) == [3, 1]
+    assert counts_from_cumulative(None, 2) is None
+
+
+def test_mismatched_row_mapping_skips_the_step(tmp_path, caplog):
+    """Rather than misattribute activations, capture nothing for that step."""
+    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+
+    capturer.begin_step(["a", "b"], torch.arange(3), 3)
+    assert not capturer._active
+    model(torch.randn(3, HIDDEN))
+    capturer.end_step()
+    capturer.finish_requests(["a", "b"])
+    capturer.shutdown()
+
+    assert not list(tmp_path.glob("*.safetensors"))

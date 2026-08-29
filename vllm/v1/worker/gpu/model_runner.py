@@ -392,6 +392,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
             self.signal_capturer = maybe_build_capturer(self.vllm_config, self.model)
+            signal_owns_aux = False
             if (
                 self.signal_capturer is not None
                 and self.signal_capturer.backend == "graph"
@@ -404,9 +405,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 self.signal_capturer.enable_graph_aux(self.model)
                 self.use_aux_hidden_state_outputs = True
+                signal_owns_aux = True
 
-
-            if self.use_aux_hidden_state_outputs:
+            if self.use_aux_hidden_state_outputs and not signal_owns_aux:
+                # Skipped when signal capture owns the auxiliary layers: this
+                # call would otherwise overwrite them with EAGLE-3's defaults,
+                # leaving capture reading layers it never asked for.
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if isinstance(self.speculator, DraftModelSpeculator):

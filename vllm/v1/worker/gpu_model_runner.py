@@ -630,6 +630,7 @@ class GPUModelRunner(
 
         self.use_aux_hidden_state_outputs = False
         self.signal_capturer: SignalCapturer | None = None
+        self._signal_owns_aux = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -5463,6 +5464,7 @@ class GPUModelRunner(
                     )
                     self.signal_capturer.enable_graph_aux(self.get_model())
                     self.use_aux_hidden_state_outputs = True
+                    self._signal_owns_aux = True
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
@@ -5568,7 +5570,9 @@ class GPUModelRunner(
         get_offloader().post_init()
 
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
-        if not self.use_aux_hidden_state_outputs:
+        if not self.use_aux_hidden_state_outputs or self._signal_owns_aux:
+            # Signal capture owns the auxiliary layers; re-deriving them here
+            # would overwrite what it asked for.
             return
 
         if not supports_eagle3(self.get_model()):

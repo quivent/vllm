@@ -1805,17 +1805,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
-        if self._signal_aux_outputs and self.is_last_pp_rank:
-            # Capture's own aux outputs: read them, then hand the runner a plain
-            # tensor so everything downstream, the speculator included, sees the
-            # model it expects.
-            if (
-                isinstance(model_output, tuple)
-                and len(model_output) == 2
-                and self.signal_capturer is not None
-            ):
-                self.signal_capturer.observe_aux(model_output[1])
-                model_output = model_output[0]
+        # Capture's own aux outputs: read them, then hand the runner a plain
+        # tensor so everything downstream, the speculator included, sees the
+        # model output it expects.
+        if (
+            self._signal_aux_outputs
+            and self.is_last_pp_rank
+            and self.signal_capturer is not None
+            and isinstance(model_output, tuple)
+            and len(model_output) == 2
+        ):
+            self.signal_capturer.observe_aux(model_output[1])
+            model_output = model_output[0]
 
         if self.signal_capturer is not None:
             self.signal_capturer.disarm()

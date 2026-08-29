@@ -91,7 +91,20 @@ else
   bad "nvcc" "flashinfer will fail at startup; --fix installs the pip package"
 fi
 
-# 4. ninja. Same JIT path, different missing piece:
+# 4a. A host C++ compiler. nvcc shells out to it, and a box with gcc but no g++
+#     fails deep inside the JIT with:
+#       gcc: fatal error: cannot execute 'cc1plus': execvp: No such file
+#       nvcc fatal: Failed to preprocess host compiler properties
+if command -v g++ >/dev/null && echo 'int main(){}' | g++ -x c++ - -o /dev/null 2>/dev/null; then
+  ok "g++" "$(command -v g++)"
+elif (( FIX )); then
+  sudo apt-get install -y g++ >/dev/null 2>&1
+  command -v g++ >/dev/null && fixed "g++" "installed" || bad "g++" "apt-get install g++"
+else
+  bad "g++" "nvcc needs a host C++ compiler; --fix installs it"
+fi
+
+# 4b. ninja. Same JIT path, different missing piece:
 #      FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
 if [[ -x "$VENV/bin/ninja" ]] || command -v ninja >/dev/null; then
   ok "ninja" "present"

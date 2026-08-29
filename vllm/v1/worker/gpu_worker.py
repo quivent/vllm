@@ -1438,6 +1438,36 @@ class Worker(WorkerBase):
             return None
         return capturer.set_runtime(tier=tier, tokens=tokens, layers=layers)
 
+    def set_signal_injection(
+        self,
+        source: str | None = None,
+        layer: int | None = None,
+        alpha: float = 1.0,
+        mode: str = "add",
+        positions: str = "first",
+        signal: str = "residual",
+        row: int = -1,
+    ) -> dict | None:
+        """Install or clear a residual injection. See `/signals/inject`."""
+        capturer = getattr(self.model_runner, "signal_capturer", None)
+        if capturer is None:
+            return None
+        if source is None:
+            return capturer.set_injection(None)
+        return capturer.load_injection(
+            source=source,
+            layer=layer,
+            alpha=alpha,
+            mode=mode,
+            positions=positions,
+            signal=signal,
+            row=row,
+        )
+
+    def get_signal_injection_status(self) -> dict | None:
+        capturer = getattr(self.model_runner, "signal_capturer", None)
+        return None if capturer is None else capturer.injector.status()
+
     def get_signal_capture_status(self) -> dict | None:
         """Report what signal capture is doing on this worker."""
         capturer = getattr(self.model_runner, "signal_capturer", None)

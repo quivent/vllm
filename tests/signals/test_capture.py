@@ -735,3 +735,147 @@ def test_q_and_k_come_off_the_attention_call(tmp_path):
     _, header = read_deposit(deposit_path(tmp_path, "r"))
     assert header["qcur"]["shape"] == [2 * N_LAYERS, N_HEAD * HEAD_DIM]
     assert header["kcur"]["shape"] == [2 * N_LAYERS, N_KV * HEAD_DIM]
+
+
+# ── injection: put a captured residual back into the forward pass ────────────
+
+
+def _captured_vector(tmp_path, layer=N_LAYERS - 1):
+    """Capture one turn, and return its deposit path."""
+    config = SignalCaptureConfig(
+        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), layers=str(layer)
+    )
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake", hidden_size=HIDDEN)
+    run_steps(capturer, model, ["donor"], n_steps=2)
+    capturer.shutdown()
+    return deposit_path(tmp_path, "donor")
+
+
+def _injectable(tmp_path):
+    config = SignalCaptureConfig(tier=Tier.OFF, output_dir=str(tmp_path))
+    model = FakeModel()
+    return (
+        SignalCapturer(config, model, model_name="fake", hidden_size=HIDDEN),
+        model,
+    )
+
+
+def test_injection_round_trips_a_captured_residual(tmp_path):
+    source = _captured_vector(tmp_path)
+    capturer, _ = _injectable(tmp_path)
+    status = capturer.load_injection(str(source), alpha=2.0, mode="add")
+
+    assert status["enabled"]
+    assert status["layer"] == N_LAYERS - 1  # taken from the deposit
+    assert status["alpha"] == 2.0
+    assert status["hidden_size"] == HIDDEN
+
+
+def test_injection_changes_the_stream_it_targets(tmp_path):
+    source = _captured_vector(tmp_path, layer=1)
+    capturer, model = _injectable(tmp_path)
+
+    x = torch.randn(1, HIDDEN)
+    torch.manual_seed(7)
+    baseline = model(x).clone()
+
+    capturer.load_injection(str(source), alpha=5.0, mode="add", positions="all")
+    capturer.begin_step(["r"], torch.arange(1), 1)
+    injected = model(x).clone()
+    capturer.end_step()
+
+    assert not torch.allclose(baseline, injected), "injection had no effect"
+    assert capturer.injector.status()["applied"] == 1
+
+
+def test_injection_is_inert_until_a_step_is_armed(tmp_path):
+    source = _captured_vector(tmp_path, layer=1)
+    capturer, model = _injectable(tmp_path)
+    capturer.load_injection(str(source), alpha=5.0, positions="all")
+
+    x = torch.randn(1, HIDDEN)
+    before = model(x).clone()
+    after = model(x).clone()
+    torch.testing.assert_close(before, after)
+    assert capturer.injector.status()["applied"] == 0
+
+
+def test_first_seeds_each_request_once(tmp_path):
+    source = _captured_vector(tmp_path, layer=1)
+    capturer, model = _injectable(tmp_path)
+    capturer.load_injection(str(source), positions="first")
+
+    for _ in range(5):
+        capturer.begin_step(["r"], torch.arange(1), 1)
+        model(torch.randn(1, HIDDEN))
+        capturer.end_step()
+
+    assert capturer.injector.status()["applied"] == 1
+
+    # A new request gets its own seed.
+    capturer.begin_step(["other"], torch.arange(1), 1)
+    model(torch.randn(1, HIDDEN))
+    capturer.end_step()
+    assert capturer.injector.status()["applied"] == 2
+
+
+def test_all_positions_injects_every_step(tmp_path):
+    source = _captured_vector(tmp_path, layer=1)
+    capturer, model = _injectable(tmp_path)
+    capturer.load_injection(str(source), positions="all")
+
+    for _ in range(4):
+        capturer.begin_step(["r"], torch.arange(1), 1)
+        model(torch.randn(1, HIDDEN))
+        capturer.end_step()
+
+    assert capturer.injector.status()["applied"] == 4
+
+
+def test_clearing_injection_removes_the_hook(tmp_path):
+    source = _captured_vector(tmp_path, layer=1)
+    capturer, model = _injectable(tmp_path)
+    capturer.load_injection(str(source), alpha=5.0, positions="all")
+    assert capturer.set_injection(None)["enabled"] is False
+
+    x = torch.randn(1, HIDDEN)
+    capturer.begin_step(["r"], torch.arange(1), 1)
+    injected = model(x).clone()
+    capturer.end_step()
+    torch.testing.assert_close(model(x), injected)
+
+
+def test_a_mismatched_vector_is_refused(tmp_path):
+    from vllm.signals.inject import InjectionSpec
+
+    capturer, _ = _injectable(tmp_path)
+    with pytest.raises(ValueError, match="different model"):
+        capturer.set_injection(InjectionSpec(vector=torch.randn(HIDDEN + 1), layer=0))
+    with pytest.raises(ValueError, match="outside this model"):
+        capturer.set_injection(InjectionSpec(vector=torch.randn(HIDDEN), layer=999))
+    with pytest.raises(ValueError, match="unknown injection mode"):
+        capturer.set_injection(
+            InjectionSpec(vector=torch.randn(HIDDEN), layer=0, mode="blend")
+        )
+
+
+def test_replace_mode_sets_the_stream_to_the_captured_state(tmp_path):
+    from safetensors.torch import load_file
+
+    source = _captured_vector(tmp_path, layer=1)
+    vector = load_file(source)["residual"][-1].float()
+
+    capturer, model = _injectable(tmp_path)
+    capturer.load_injection(str(source), mode="replace", positions="all")
+
+    captured = {}
+    layer = capturer.layers[1]
+    layer.register_forward_hook(
+        lambda m, a, out: captured.__setitem__("residual", out[1].clone())
+    )
+    capturer.begin_step(["r"], torch.arange(1), 1)
+    model(torch.randn(1, HIDDEN))
+    capturer.end_step()
+
+    torch.testing.assert_close(captured["residual"][0].float(), vector)

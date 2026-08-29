@@ -690,6 +690,15 @@ class EngineArgs:
         ObservabilityConfig, "signal_capture_max_bytes"
     )
     signal_capture_session: str | None = ObservabilityConfig.signal_capture_session
+    signal_inject_from: str | None = ObservabilityConfig.signal_inject_from
+    signal_inject_layer: int | None = ObservabilityConfig.signal_inject_layer
+    signal_inject_alpha: float = ObservabilityConfig.signal_inject_alpha
+    signal_inject_mode: Literal["add", "replace"] = (
+        ObservabilityConfig.signal_inject_mode
+    )
+    signal_inject_positions: Literal["first", "all"] = (
+        ObservabilityConfig.signal_inject_positions
+    )
     enable_layerwise_nvtx_tracing: bool = (
         ObservabilityConfig.enable_layerwise_nvtx_tracing
     )
@@ -1568,6 +1577,26 @@ class EngineArgs:
             **observability_kwargs["signal_capture_session"],
         )
         observability_group.add_argument(
+            "--signal-inject-from",
+            **observability_kwargs["signal_inject_from"],
+        )
+        observability_group.add_argument(
+            "--signal-inject-layer",
+            **observability_kwargs["signal_inject_layer"],
+        )
+        observability_group.add_argument(
+            "--signal-inject-alpha",
+            **observability_kwargs["signal_inject_alpha"],
+        )
+        observability_group.add_argument(
+            "--signal-inject-mode",
+            **observability_kwargs["signal_inject_mode"],
+        )
+        observability_group.add_argument(
+            "--signal-inject-positions",
+            **observability_kwargs["signal_inject_positions"],
+        )
+        observability_group.add_argument(
             "--enable-layerwise-nvtx-tracing",
             **observability_kwargs["enable_layerwise_nvtx_tracing"],
         )
@@ -2028,6 +2057,11 @@ class EngineArgs:
             signal_capture_dtype=self.signal_capture_dtype,
             signal_capture_max_bytes=self.signal_capture_max_bytes,
             signal_capture_session=self.signal_capture_session,
+            signal_inject_from=self.signal_inject_from,
+            signal_inject_layer=self.signal_inject_layer,
+            signal_inject_alpha=self.signal_inject_alpha,
+            signal_inject_mode=self.signal_inject_mode,
+            signal_inject_positions=self.signal_inject_positions,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,

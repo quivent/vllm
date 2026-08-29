@@ -21,6 +21,11 @@ logger = init_logger(__name__)
 
 router = APIRouter()
 
+_NOT_CONFIGURED = (
+    "Signal capture/injection is not configured on this engine. Restart with "
+    "--signal-capture-max-tier (and --signal-capture-dir), or --signal-inject-from."
+)
+
 
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
@@ -89,6 +94,62 @@ async def signals_control(raw_request: Request):
             status_code=HTTPStatus.CONFLICT.value,
             detail="Signal capture is not configured on this engine. Restart "
             "with --signal-capture-max-tier and --signal-capture-dir.",
+        )
+    return JSONResponse(content=status)
+
+
+@router.get("/signals/injection")
+async def signals_injection_status(raw_request: Request):
+    """Report the residual injection currently installed, if any."""
+    results = await engine_client(raw_request).collective_rpc(
+        method="get_signal_injection_status"
+    )
+    status = _first(results)
+    if status is None:
+        return JSONResponse(content={"enabled": False, "detail": _NOT_CONFIGURED})
+    return JSONResponse(content=status)
+
+
+@router.post("/signals/inject")
+async def signals_inject(raw_request: Request):
+    """Inject a captured residual back into the forward pass.
+
+    Body::
+
+        {
+            "source": "/path/turn.safetensors",  # omit to clear the injection
+            "layer": 63,  # default: where it was recorded
+            "alpha": 1.0,
+            "mode": "add" | "replace",
+            "positions": "first" | "all",
+            "row": -1,
+        }
+
+    `add` steers along the captured direction; `replace` makes the captured
+    state *be* the state at that layer. `first` seeds each request once --
+    the "starting point" reading -- while `all` holds it for the whole turn.
+    """
+    body = await raw_request.json() if await raw_request.body() else {}
+    kwargs = {
+        key: body[key]
+        for key in ("source", "layer", "alpha", "mode", "positions", "signal", "row")
+        if key in body
+    }
+
+    logger.info("Signal injection: %s", kwargs or "clear")
+    try:
+        results = await engine_client(raw_request).collective_rpc(
+            method="set_signal_injection", kwargs=kwargs
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)
+        ) from exc
+
+    status = _first(results)
+    if status is None:
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT.value, detail=_NOT_CONFIGURED
         )
     return JSONResponse(content=status)
 

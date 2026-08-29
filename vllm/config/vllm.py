@@ -1309,7 +1309,10 @@ class VllmConfig:
             )
             self.model_config.disable_cascade_attn = True
 
-        if self.observability_config.signal_capture_enabled:
+        if (
+            self.observability_config.signal_capture_enabled
+            or self.observability_config.signal_inject_from
+        ):
             from vllm.signals.tiers import Tier, tier_from_str
 
             observability = self.observability_config
@@ -1317,8 +1320,11 @@ class VllmConfig:
                 observability.signal_capture_max_tier
                 or observability.signal_capture_tier
             )
+            needs_hooks = tier >= Tier.LAYER_STATS or bool(
+                observability.signal_inject_from
+            )
             if (
-                tier >= Tier.LAYER_STATS
+                needs_hooks
                 and self.model_config is not None
                 and not self.model_config.enforce_eager
             ):
@@ -1326,10 +1332,11 @@ class VllmConfig:
                 # hooks. Those are captured into a CUDA graph but never re-run on
                 # replay, so the deposits would silently go empty after warmup.
                 logger.warning(
-                    "Signal capture tier '%s' taps the forward pass with module "
+                    "Signal capture/injection taps the forward pass with module "
                     "hooks, which do not run on CUDA graph replay. Enabling "
-                    "enforce_eager so capture records every step.",
+                    "enforce_eager so every step is seen (tier=%s, inject=%s).",
                     tier.wire_name,
+                    bool(observability.signal_inject_from),
                 )
                 self.model_config.enforce_eager = True
 

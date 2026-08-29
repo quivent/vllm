@@ -45,6 +45,7 @@ from vllm.logger import init_logger
 from vllm.signals import reductions
 from vllm.signals.config import SignalCaptureConfig
 from vllm.signals.deposit import Deposit
+from vllm.signals.inject import InjectionSpec, SignalInjector
 from vllm.signals.tiers import (
     ALL_SIGNALS,
     SIG_ATTN_NORM,
@@ -114,6 +115,7 @@ class SignalCapturer:
         head_dim: int = 0,
         num_heads: int = 0,
         num_kv_heads: int = 0,
+        hidden_size: int = 0,
     ):
         self.config = config
         self.model_name = model_name
@@ -135,6 +137,8 @@ class SignalCapturer:
         self.tapped_layers = set(config.resolve_layers(len(self.layers)))
         self._hooked_layers = set(self.tapped_layers)
         self._token_reduce = config.tokens
+        self.injector = SignalInjector(len(self.layers), hidden_size)
+        self._inject_handle = None
         self.enabled = bool(self.tapped_layers)
 
         self._deposits: dict[str, Deposit] = {}
@@ -320,8 +324,13 @@ class SignalCapturer:
             num_tokens: rows in this batch's token dimension, used to tell
                 per-token activations apart from other tensors the hooks see.
         """
-        if not self.enabled or not row_req_ids or self.tier == Tier.OFF:
+        if not row_req_ids:
             self._active = False
+            self.injector.begin_step([], row_index)
+            return
+        if not self.enabled or self.tier == Tier.OFF:
+            self._active = False
+            self.injector.begin_step(row_req_ids, row_index.to(torch.long))
             return
         if any(map(is_internal_request, row_req_ids)):
             keep = [
@@ -368,6 +377,7 @@ class SignalCapturer:
         self._row_index = row_index.to(torch.long)
         self._num_tokens = num_tokens
         self._active = True
+        self.injector.begin_step(row_req_ids, self._row_index)
 
     def disarm(self) -> None:
         """Stop the hooks staging, without draining yet.
@@ -405,6 +415,7 @@ class SignalCapturer:
             self._staged_logits = None
             self._row_index = None
             self._row_req_ids = []
+            self.injector.end_step()
 
     def _warn_on_silent_signals(self) -> None:
         """Say so when a tier asks for a signal no tap produced.
@@ -585,6 +596,90 @@ class SignalCapturer:
             "recording": self.tier != Tier.OFF and self.enabled,
         }
 
+    def set_injection(self, spec: InjectionSpec | None) -> dict:
+        """Install or clear a residual injection, hooking the target layer.
+
+        The hook is registered on demand rather than planned at startup, so any
+        layer can be injected into regardless of which ones capture taps.
+        """
+        if self._inject_handle is not None:
+            self._inject_handle.remove()
+            self._inject_handle = None
+        status = self.injector.set_spec(spec)
+        if spec is not None:
+            layer = self.layers[spec.layer]
+            self._inject_handle = layer.register_forward_hook(
+                self._make_injection_hook(spec.layer)
+            )
+        return status
+
+    def load_injection(
+        self,
+        source: str,
+        layer: int | None = None,
+        alpha: float = 1.0,
+        mode: str = "add",
+        positions: str = "first",
+        signal: str = "residual",
+        row: int = -1,
+    ) -> dict:
+        """Load a vector out of a deposit and install it as the injection.
+
+        ``layer`` defaults to the layer the vector was recorded at, which is
+        almost always what you want: a residual only means the same thing at
+        the depth it came from.
+        """
+        from vllm.signals.inject import load_vector
+
+        vector, metadata = load_vector(source, signal=signal, layer=layer, row=row)
+        if layer is None:
+            layer = _recorded_layer(source, signal, row)
+            if layer is None:
+                raise ValueError(
+                    f"{source} does not record which layer its {signal!r} came "
+                    "from; pass an explicit layer."
+                )
+        spec = InjectionSpec(
+            vector=vector,
+            layer=layer,
+            alpha=alpha,
+            mode=mode,
+            positions=positions,
+            source=source,
+        )
+        if (
+            metadata.get("model")
+            and self.model_name
+            and metadata["model"] != self.model_name
+        ):
+            logger.warning(
+                "Signal injection: vector was captured from %s but this server "
+                "serves %s; residuals are not portable between models.",
+                metadata["model"],
+                self.model_name,
+            )
+        return self.set_injection(spec)
+
+    def _make_injection_hook(self, layer_idx: int):
+        """Rewrites a layer's residual stream on the way out."""
+
+        def hook(_module, _args, output):
+            if isinstance(output, (tuple, list)) and len(output) >= 2:
+                hidden, residual = output[0], output[1]
+                if residual is None:
+                    updated = self.injector.apply(layer_idx, hidden)
+                    return None if updated is None else (updated, *output[1:])
+                # The stream is hidden + residual; adding to the residual half
+                # shifts the stream the next layer sees, leaving this layer's
+                # own output untouched.
+                updated = self.injector.apply(layer_idx, residual)
+                return None if updated is None else (hidden, updated, *output[2:])
+            if torch.is_tensor(output):
+                return self.injector.apply(layer_idx, output)
+            return None
+
+        return hook
+
     def _register_exit_flush(self) -> None:
         """Last-resort flush, in case the runner is torn down without shutdown().
 
@@ -604,6 +699,7 @@ class SignalCapturer:
         """Write and retire the deposits for finished requests."""
         if not self.enabled:
             return
+        self.injector.forget(request_ids)
         for rid in request_ids:
             deposit = self._deposits.pop(rid, None)
             self._token_counter.pop(rid, None)
@@ -654,6 +750,16 @@ def _resolve(root: nn.Module, path: str) -> nn.Module | None:
     return node
 
 
+def _recorded_layer(path: str, signal: str, row: int) -> int | None:
+    """The layer index a deposit recorded a given row at."""
+    from safetensors.torch import load_file
+
+    index = load_file(path).get(f"{signal}.index")
+    if index is None or index.ndim != 2 or index.shape[1] < 2:
+        return None
+    return int(index[row, 1])
+
+
 def _safe_name(request_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", request_id)[:180]
 
@@ -693,7 +799,7 @@ def maybe_build_capturer(vllm_config, model: nn.Module) -> "SignalCapturer | Non
     should be writing deposits.
     """
     observability = vllm_config.observability_config
-    if not observability.signal_capture_enabled:
+    if not (observability.signal_capture_enabled or observability.signal_inject_from):
         return None
 
     if vllm_config.parallel_config.pipeline_parallel_size > 1:
@@ -724,11 +830,27 @@ def maybe_build_capturer(vllm_config, model: nn.Module) -> "SignalCapturer | Non
             # without it that fallback is simply unavailable.
             logger.debug("Signal capture: head geometry unavailable", exc_info=True)
 
-    return SignalCapturer(
+    capturer = SignalCapturer(
         SignalCaptureConfig.from_observability(observability),
         model,
         model_name=model_config.model if model_config is not None else "",
         head_dim=head_dim,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
+        hidden_size=model_config.get_hidden_size() if model_config else 0,
     )
+
+    if observability.signal_inject_from:
+        try:
+            capturer.load_injection(
+                source=observability.signal_inject_from,
+                layer=observability.signal_inject_layer,
+                alpha=observability.signal_inject_alpha,
+                mode=observability.signal_inject_mode,
+                positions=observability.signal_inject_positions,
+            )
+        except Exception as exc:
+            logger.error("Signal injection could not be configured: %s", exc)
+            raise
+
+    return capturer

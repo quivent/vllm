@@ -139,6 +139,25 @@ class ObservabilityConfig:
     stops recording and is marked `truncated` in its deposit metadata, rather
     than growing without limit. 0 disables the cap."""
 
+    signal_inject_from: str | None = None
+    """Path to a `sigcap-v1` deposit whose residual is injected back into the
+    forward pass. Enables injection; also forces eager execution, since a
+    rewritten layer output would otherwise be baked into a CUDA graph."""
+
+    signal_inject_layer: int | None = None
+    """Layer to inject at. Defaults to the layer the vector was recorded at."""
+
+    signal_inject_alpha: float = 1.0
+    """Scale on the injected vector."""
+
+    signal_inject_mode: Literal["add", "replace"] = "add"
+    """`add` steers (`stream += alpha * v`); `replace` sets the stream to the
+    captured state, so generation continues from it."""
+
+    signal_inject_positions: Literal["first", "all"] = "first"
+    """`first` seeds only each request's first sampled position -- the
+    "starting point" reading; `all` holds the influence across the turn."""
+
     signal_capture_session: str | None = None
     """Free-form session label written into deposit metadata, for grouping the
     deposits of one experiment."""
@@ -275,6 +294,8 @@ class ObservabilityConfig:
     def _validate_signal_capture(self):
         from vllm.signals.tiers import Tier, tier_from_str
 
+        if self.signal_inject_alpha != self.signal_inject_alpha:  # NaN guard
+            raise ValueError("signal_inject_alpha must be a real number")
         effective = tier_from_str(self.signal_capture_effective_tier)
         if effective != Tier.OFF and not self.signal_capture_dir:
             raise ValueError(

@@ -62,8 +62,6 @@ from vllm.signals.tiers import (
 
 logger = init_logger(__name__)
 
-_SIG_QKV = "_qkv"
-
 _LAYER_NAME_RE = re.compile(r"^(?P<prefix>.*\.layers)\.(?P<idx>\d+)$")
 
 
@@ -122,7 +120,6 @@ class SignalCapturer:
         self.head_dim = head_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.rope_phase = "post"
         self.tier = config.tier
         self.max_tier = config.max_tier
 
@@ -202,18 +199,20 @@ class SignalCapturer:
             if want_gate:
                 self._hook_named(layer, "mlp.act_fn", SIG_GATE, idx, missing)
             if want_qk:
-                rotary = _resolve(layer, "self_attn.rotary_emb")
-                if rotary is not None:
-                    self._hook(rotary, self._make_qk_hook(idx))
-                # Some architectures (Qwen3-Next among them) apply RoPE with a
-                # fused kernel that reads rotary_emb's cache without calling the
-                # module, so the hook above never fires. Tap the fused QKV
-                # projection too and split it if nothing post-RoPE arrives.
-                qkv = _resolve(layer, "self_attn.qkv_proj")
-                if qkv is not None and self._can_split_qkv:
-                    self._hook(qkv, self._make_simple_hook(_SIG_QKV, idx))
-                elif rotary is None:
-                    missing.add("qcur/kcur")
+                # vLLM's Attention module is *called with* post-RoPE q, k, v,
+                # whatever the architecture did to produce them -- fused RoPE,
+                # gated projections, QK-norm. A pre-hook reads them straight off
+                # the call, which the rotary_emb tap cannot do when RoPE is
+                # applied by a kernel that never invokes the module.
+                attn = _resolve(layer, "self_attn.attn")
+                if attn is not None:
+                    self._hook_pre(attn, self._make_qk_pre_hook(idx))
+                else:
+                    rotary = _resolve(layer, "self_attn.rotary_emb")
+                    if rotary is None:
+                        missing.add("qcur/kcur")
+                    else:
+                        self._hook(rotary, self._make_qk_hook(idx))
 
         if missing:
             logger.warning(
@@ -225,6 +224,9 @@ class SignalCapturer:
     def _hook(self, module: nn.Module, fn) -> None:
         self._handles.append(module.register_forward_hook(fn))
 
+    def _hook_pre(self, module: nn.Module, fn) -> None:
+        self._handles.append(module.register_forward_pre_hook(fn))
+
     def _hook_named(
         self, layer: nn.Module, path: str, signal: str, idx: int, missing: set[str]
     ) -> None:
@@ -233,18 +235,6 @@ class SignalCapturer:
             missing.add(signal)
             return
         self._hook(module, self._make_simple_hook(signal, idx))
-
-    @property
-    def _can_split_qkv(self) -> bool:
-        return self.head_dim > 0 and self.num_heads > 0 and self.num_kv_heads > 0
-
-    def _split_qkv(self, rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[rows, (n_head + 2*n_kv) * head_dim] -> (queries, keys)."""
-        q_width = self.num_heads * self.head_dim
-        kv_width = self.num_kv_heads * self.head_dim
-        if rows.shape[-1] != q_width + 2 * kv_width:
-            raise ValueError("qkv width does not match the model's head geometry")
-        return rows[:, :q_width], rows[:, q_width : q_width + kv_width]
 
     def _make_residual_hook(self, layer_idx: int):
         def hook(_module, _args, output):
@@ -269,6 +259,20 @@ class SignalCapturer:
             tensor = _first_tensor(output)
             if tensor is not None:
                 self._stage(signal, layer_idx, tensor)
+
+        return hook
+
+    def _make_qk_pre_hook(self, layer_idx: int):
+        """Reads the (q, k, v) a decoder layer hands to its attention."""
+
+        def hook(_module, args):
+            if not self._active or len(args) < 2:
+                return
+            query, key = args[0], args[1]
+            if torch.is_tensor(query):
+                self._stage(SIG_QCUR, layer_idx, query)
+            if torch.is_tensor(key):
+                self._stage(SIG_KCUR, layer_idx, key)
 
         return hook
 
@@ -429,30 +433,6 @@ class SignalCapturer:
         raw_mode = {sig: mode_for(self.tier, sig) is Mode.RAW for sig in self._staged}
         host: dict[str, tuple[list[int], torch.Tensor]] = {}
 
-        fused = self._staged.pop(_SIG_QKV, None)
-        if fused and SIG_QCUR not in self._staged:
-            # Nothing post-RoPE arrived; fall back to the projection output.
-            try:
-                for layer_idx, rows in fused.items():
-                    query, key = self._split_qkv(rows)
-                    self._staged[SIG_QCUR][layer_idx] = query
-                    self._staged[SIG_KCUR][layer_idx] = key
-                if self.rope_phase != "pre":
-                    self.rope_phase = "pre"
-                    logger.warning_once(
-                        "Signal capture: this architecture applies RoPE with a "
-                        "fused kernel, so post-RoPE Q/K are not observable. "
-                        "Recording pre-RoPE qcur/kcur from qkv_proj instead; "
-                        "deposits are marked rope_phase=pre."
-                    )
-            except ValueError:
-                logger.warning_once(
-                    "Signal capture: could not split this model's fused QKV "
-                    "projection; qcur/kcur will be absent."
-                )
-                self._staged.pop(SIG_QCUR, None)
-                self._staged.pop(SIG_KCUR, None)
-
         self._warn_on_silent_signals()
 
         # ALL_SIGNALS order puts qcur before kcur, which the Q-K cosine needs.
@@ -530,7 +510,6 @@ class SignalCapturer:
                 session=self.config.session,
                 max_bytes=self.config.max_bytes,
                 token_reduce=self._token_reduce,
-                rope_phase=self.rope_phase,
             )
             self._deposits[request_id] = deposit
         return deposit

@@ -689,3 +689,49 @@ def test_a_reused_request_id_does_not_clobber_an_earlier_turn(tmp_path):
     capturer.shutdown()
 
     assert len(list(tmp_path.glob("*.safetensors"))) == 3
+
+
+def test_q_and_k_come_off_the_attention_call(tmp_path):
+    """Post-RoPE q/k are read from the Attention call, not from rotary_emb.
+
+    Architectures that fuse RoPE into a kernel never invoke rotary_emb, but
+    every one of them still calls attention with the finished q, k, v.
+    """
+
+    class FusedRoPEAttn(nn.Module):
+        """No rotary_emb module at all -- RoPE folded into the projection."""
+
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = nn.Linear(HIDDEN, (N_HEAD + 2 * N_KV) * HEAD_DIM)
+            self.attn = nn.Module()
+            self.attn.forward = lambda q, k, v: q
+            self.o_proj = nn.Linear(N_HEAD * HEAD_DIM, HIDDEN)
+
+        def forward(self, x):
+            q, k, v = self.qkv_proj(x).split(
+                [N_HEAD * HEAD_DIM, N_KV * HEAD_DIM, N_KV * HEAD_DIM], dim=-1
+            )
+            return self.o_proj(self.attn(q, k, v))
+
+    class FusedLayer(FakeLayer):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = FusedRoPEAttn()
+
+    class FusedModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.model.layers = nn.ModuleList(FusedLayer() for _ in range(N_LAYERS))
+
+    config = SignalCaptureConfig(
+        tier=Tier.FULL_RAW, output_dir=str(tmp_path), layers="all", tokens="all"
+    )
+    model = FusedModel()
+    capturer = SignalCapturer(config, model, model_name="fake", head_dim=HEAD_DIM)
+    run_steps(capturer, model, ["r"], n_steps=2)
+    capturer.shutdown()
+
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
+    assert header["qcur"]["shape"] == [2 * N_LAYERS, N_HEAD * HEAD_DIM]
+    assert header["kcur"]["shape"] == [2 * N_LAYERS, N_KV * HEAD_DIM]

@@ -153,11 +153,9 @@ class Deposit:
         session: str = "",
         max_bytes: int = 0,
         token_reduce: str = "all",
-        rope_phase: str = "post",
     ):
         self.request_id = request_id
         self.token_reduce = token_reduce
-        self.rope_phase = rope_phase
         self.tier = tier
         self.layer_step = layer_step
         self.token_step = token_step
@@ -259,7 +257,6 @@ class Deposit:
             "layer_step": str(self.layer_step),
             "token_step": str(self.token_step),
             "token_reduce": self.token_reduce,
-            "rope_phase": self.rope_phase,
             "model": self.model,
             "session": self.session,
             "request_id": self.request_id,

@@ -631,6 +631,7 @@ class GPUModelRunner(
         self.use_aux_hidden_state_outputs = False
         self.signal_capturer: SignalCapturer | None = None
         self._signal_owns_aux = False
+        self._signal_aux_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -4535,11 +4536,11 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
-            if self.signal_capturer is not None:
-                if self.signal_capturer.backend == "graph" and isinstance(
-                    model_output, tuple
-                ):
+            if self._signal_aux_outputs and isinstance(model_output, tuple):
+                if self.signal_capturer is not None:
                     self.signal_capturer.observe_aux(model_output[1])
+                model_output = model_output[0]
+            if self.signal_capturer is not None:
                 self.signal_capturer.disarm()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
@@ -5463,7 +5464,9 @@ class GPUModelRunner(
                         self.get_model(), self.use_aux_hidden_state_outputs
                     )
                     self.signal_capturer.enable_graph_aux(self.get_model())
-                    self.use_aux_hidden_state_outputs = True
+                    # Not use_aux_hidden_state_outputs: that flag also steers
+                    # the speculator onto the EAGLE-3 path, which MTP fails.
+                    self._signal_aux_outputs = True
                     self._signal_owns_aux = True
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.

@@ -346,6 +346,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb = EPLBController(self.parallel_config, self.device)
         self.routed_experts_capturer: RoutedExpertsCapturer | None = None
         self.signal_capturer: SignalCapturer | None = None
+        self._signal_aux_outputs = False
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
 
@@ -404,7 +405,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.model, self.use_aux_hidden_state_outputs
                 )
                 self.signal_capturer.enable_graph_aux(self.model)
-                self.use_aux_hidden_state_outputs = True
+                # Deliberately NOT use_aux_hidden_state_outputs: the speculator
+                # branches on that flag and takes the EAGLE-3 path, which an MTP
+                # drafter fails on (`assert self.method == "eagle3"`). Capture
+                # only needs the model's extra return value unpacked.
+                self._signal_aux_outputs = True
                 signal_owns_aux = True
 
             if self.use_aux_hidden_state_outputs and not signal_owns_aux:
@@ -1800,11 +1805,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if self._signal_aux_outputs and self.is_last_pp_rank:
+            # Capture's own aux outputs: read them, then hand the runner a plain
+            # tensor so everything downstream, the speculator included, sees the
+            # model it expects.
+            if (
+                isinstance(model_output, tuple)
+                and len(model_output) == 2
+                and self.signal_capturer is not None
+            ):
+                self.signal_capturer.observe_aux(model_output[1])
+                model_output = model_output[0]
+
         if self.signal_capturer is not None:
-            if self.signal_capturer.backend == "graph" and self.is_last_pp_rank:
-                model_out = model_output
-                if isinstance(model_out, tuple) and len(model_out) == 2:
-                    self.signal_capturer.observe_aux(model_out[1])
             self.signal_capturer.disarm()
 
         if self.is_last_pp_rank:

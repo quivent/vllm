@@ -879,3 +879,102 @@ def test_replace_mode_sets_the_stream_to_the_captured_state(tmp_path):
     capturer.end_step()
 
     torch.testing.assert_close(captured["residual"][0].float(), vector)
+
+
+# ── building an injectable vector from several turns ─────────────────────────
+
+
+def _turns(tmp_path, n, layer=1):
+    config = SignalCaptureConfig(
+        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), layers=str(layer)
+    )
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake", hidden_size=HIDDEN)
+    for i in range(n):
+        run_steps(capturer, model, [f"t{i}"], n_steps=2)
+        capturer.finish_requests([f"t{i}"])
+    capturer.shutdown()
+    return sorted(str(p) for p in tmp_path.glob("*.safetensors"))
+
+
+def test_mean_averages_the_turns_it_is_given(tmp_path):
+    from safetensors.torch import load_file
+
+    from vllm.signals.build import collect, main
+
+    paths = _turns(tmp_path, 4)
+    out = str(tmp_path / "mean.safetensors")
+    assert main(["mean", *paths, "-o", out]) == 0
+
+    rows, layer = collect(paths, "residual", None)
+    torch.testing.assert_close(
+        load_file(out)["residual"][0], rows.mean(0), rtol=1e-5, atol=1e-5
+    )
+    assert layer == 1
+
+
+def test_diff_is_the_direction_between_two_sets(tmp_path):
+    from safetensors.torch import load_file
+
+    from vllm.signals.build import collect, main
+
+    a = _turns(tmp_path / "a", 3)
+    b = _turns(tmp_path / "b", 3)
+    out = str(tmp_path / "diff.safetensors")
+    assert main(["diff", "--a", *a, "--b", *b, "-o", out]) == 0
+
+    a_rows, _ = collect(a, "residual", None)
+    b_rows, _ = collect(b, "residual", None)
+    torch.testing.assert_close(
+        load_file(out)["residual"][0],
+        a_rows.mean(0) - b_rows.mean(0),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_normalize_makes_alpha_the_whole_magnitude(tmp_path):
+    from safetensors.torch import load_file
+
+    from vllm.signals.build import main
+
+    paths = _turns(tmp_path, 3)
+    out = str(tmp_path / "unit.safetensors")
+    main(["mean", *paths, "-o", out, "--normalize"])
+    assert abs(float(load_file(out)["residual"][0].norm()) - 1.0) < 1e-5
+
+
+def test_mixed_layers_are_refused_without_an_explicit_choice(tmp_path):
+    from vllm.signals.build import collect
+
+    config = SignalCaptureConfig(
+        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), layers="all"
+    )
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake", hidden_size=HIDDEN)
+    run_steps(capturer, model, ["t"], n_steps=1)
+    capturer.shutdown()
+    paths = [str(p) for p in tmp_path.glob("*.safetensors")]
+
+    with pytest.raises(ValueError, match="mix layers"):
+        collect(paths, "residual", None)
+    rows, layer = collect(paths, "residual", 2)
+    assert rows.shape == (1, HIDDEN) and layer == 2
+
+
+def test_a_built_vector_is_injectable(tmp_path):
+    """Round trip: capture turns -> build a mean -> inject it."""
+    from vllm.signals.build import main
+
+    paths = _turns(tmp_path, 3)
+    built = str(tmp_path / "built.safetensors")
+    main(["mean", *paths, "-o", built])
+
+    capturer, model = _injectable(tmp_path)
+    status = capturer.load_injection(built, alpha=1.0, positions="all")
+    assert status["enabled"] and status["layer"] == 1
+
+    capturer.begin_step(["r"], torch.arange(1), 1)
+    model(torch.randn(1, HIDDEN))
+    capturer.end_step()
+    assert capturer.injector.status()["applied"] == 1

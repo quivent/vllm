@@ -1,0 +1,67 @@
+{
+  "metadata": {
+    "dtypes": "bfloat16,float32",
+    "tier": "residual_raw",
+    "token_step": "1",
+    "request_id": "0-8a5608f8",
+    "created_at": "1788031411.203",
+    "num_captured_positions": "24",
+    "truncated": "false",
+    "format": "sigcap-v1",
+    "layer_step": "1",
+    "engine": "vllm",
+    "token_reduce": "last",
+    "model": "Qwen/Qwen3-0.6B",
+    "session": ""
+  },
+  "tensors": {
+    "logit": {
+      "shape": [
+        1,
+        3
+      ],
+      "dtype": "F32"
+    },
+    "logit.index": {
+      "shape": [
+        1,
+        1
+      ],
+      "dtype": "F32"
+    },
+    "residual.index": {
+      "shape": [
+        1,
+        2
+      ],
+      "dtype": "F32"
+    },
+    "residual": {
+      "shape": [
+        1,
+        1024
+      ],
+      "dtype": "BF16"
+    }
+  },
+  "stats": {
+    "residual": [
+      {
+        "token": 23,
+        "layer_idx": 27,
+        "activation_norm": 626.9253540039062,
+        "cosine_sim": 0.0,
+        "mean_abs": 9.841606140136719,
+        "max_abs": 308.0
+      }
+    ],
+    "logit": [
+      {
+        "token": 23,
+        "entropy": 0.4571707248687744,
+        "perplexity": 1.5795985460281372,
+        "confidence": 0.9476020336151123
+      }
+    ]
+  }
+}

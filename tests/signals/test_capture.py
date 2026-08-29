@@ -598,3 +598,55 @@ def test_status_reports_the_live_configuration(tmp_path):
     assert status["max_tier"] == "full_raw"
     assert status["num_layers"] == N_LAYERS
     assert status["tapped_layers"] == list(range(N_LAYERS))
+
+
+def test_token_metrics_follow_the_same_reduction(tmp_path):
+    """A per-turn deposit must be fixed size, so logit rows reduce too."""
+    sizes = {}
+    for n_steps in (5, 100):
+        out = tmp_path / str(n_steps)
+        config = SignalCaptureConfig(
+            tier=Tier.RESIDUAL_RAW, output_dir=str(out), tokens="last"
+        )
+        model = FakeModel()
+        capturer = SignalCapturer(config, model, model_name="fake")
+        for _ in range(n_steps):
+            capturer.begin_step(["r"], torch.arange(1), 1)
+            model(torch.randn(1, HIDDEN))
+            capturer.end_step(logits=torch.randn(1, 512))
+        capturer.shutdown()
+        _, header = read_deposit(out / "r.safetensors")
+        assert header["logit"]["shape"] == [1, 3]
+        sizes[n_steps] = (out / "r.safetensors").stat().st_size
+
+    assert sizes[5] == sizes[100], "deposit size still grows with turn length"
+
+
+def test_all_reduction_keeps_every_token_metric(tmp_path):
+    config = SignalCaptureConfig(
+        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), tokens="all"
+    )
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+    for _ in range(7):
+        capturer.begin_step(["r"], torch.arange(1), 1)
+        model(torch.randn(1, HIDDEN))
+        capturer.end_step(logits=torch.randn(1, 512))
+    capturer.shutdown()
+
+    _, header = read_deposit(tmp_path / "r.safetensors")
+    assert header["logit"]["shape"] == [7, 3]
+
+
+def test_startup_warmup_requests_are_not_recorded(tmp_path):
+    """vLLM drives synthetic warmup requests through the real execute path."""
+    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+
+    run_steps(capturer, model, ["_warmup_0_", "_warmup_1_"], n_steps=3)
+    run_steps(capturer, model, ["_warmup_2_", "real-req"], n_steps=2)
+    capturer.shutdown()
+
+    written = sorted(p.name for p in tmp_path.glob("*.safetensors"))
+    assert written == ["real-req.safetensors"]

@@ -34,6 +34,17 @@ SIG_QCUR = "qcur"  # n_head * head_dim
 SIG_KCUR = "kcur"  # n_head_kv * head_dim
 SIG_ATTN = "attn"  # n_kv * n_head (T6 only)
 
+# vLLM's startup warmup drives synthetic requests through the real execute path
+# (see v1/worker/gpu/warmup.py). Their activations are not anyone's turn, so
+# capture skips them rather than filling the deposit directory with noise.
+WARMUP_REQUEST_PREFIX = "_warmup_"
+
+
+def is_internal_request(request_id: str) -> bool:
+    """Whether a request id belongs to vLLM's own warmup, not a user turn."""
+    return request_id.startswith(WARMUP_REQUEST_PREFIX)
+
+
 ALL_SIGNALS = (
     SIG_RESIDUAL,
     SIG_ATTN_NORM,

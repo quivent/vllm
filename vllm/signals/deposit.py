@@ -165,8 +165,7 @@ class Deposit:
 
         self._raw: dict[str, _Buffer] = {}
         self._stats: dict[str, _Buffer] = {}
-        self._logit_rows: list[torch.Tensor] = []
-        self._logit_tokens: list[int] = []
+        self._logits = _Buffer(token_reduce)
 
         self.nbytes = 0
         self.truncated = False
@@ -178,7 +177,7 @@ class Deposit:
 
     @property
     def is_empty(self) -> bool:
-        return not (self._raw or self._stats or self._logit_rows)
+        return not self._raw and not self._stats and self._logits.is_empty
 
     def _budget_left(self, incoming: int) -> bool:
         if self.max_bytes <= 0:
@@ -214,12 +213,12 @@ class Deposit:
         ).append(rows, token, layer)
 
     def add_logits(self, rows: torch.Tensor, token: int) -> None:
+        """Token metrics follow the same reduction as the raw signals, so a
+        per-turn deposit stays a fixed size however long the turn runs."""
         incoming = rows.numel() * rows.element_size()
         if not self._budget_left(incoming):
             return
-        self._logit_rows.append(rows)
-        self._logit_tokens.extend([token] * rows.shape[0])
-        self.nbytes += incoming
+        self.nbytes += self._logits.append(rows, token, 0)
 
     def note_token(self) -> None:
         self.num_tokens += 1
@@ -240,9 +239,10 @@ class Deposit:
         for name, buf in sorted(self._stats.items()):
             tensors[f"stats.{name}"] = buf.stack()
             tensors[f"stats.{name}.index"] = self._index(*buf.index_pairs())
-        if self._logit_rows:
-            tensors["logit"] = torch.cat(self._logit_rows, dim=0)
-            tensors["logit.index"] = self._index(self._logit_tokens, None)
+        if not self._logits.is_empty:
+            tensors["logit"] = self._logits.stack()
+            tokens, _ = self._logits.index_pairs()
+            tensors["logit.index"] = self._index(tokens, None)
 
         dtypes = {str(t.dtype).removeprefix("torch.") for t in tensors.values()}
         metadata = {

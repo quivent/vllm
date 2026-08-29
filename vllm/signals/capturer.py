@@ -54,6 +54,7 @@ from vllm.signals.tiers import (
     SIG_RESIDUAL,
     Mode,
     Tier,
+    is_internal_request,
     mode_for,
     tier_from_str,
 )
@@ -288,6 +289,16 @@ class SignalCapturer:
         if not self.enabled or not row_req_ids or self.tier == Tier.OFF:
             self._active = False
             return
+        if any(map(is_internal_request, row_req_ids)):
+            keep = [
+                i for i, rid in enumerate(row_req_ids) if not is_internal_request(rid)
+            ]
+            if not keep:
+                self._active = False
+                return
+            sel = torch.tensor(keep, device=row_index.device, dtype=torch.long)
+            row_index = row_index.index_select(0, sel)
+            row_req_ids = [row_req_ids[i] for i in keep]
         if len(row_req_ids) != row_index.shape[0]:
             # The row->request mapping disagrees with the gather indices; record
             # nothing rather than misattribute activations to the wrong request.

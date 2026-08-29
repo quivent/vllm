@@ -60,6 +60,12 @@ from vllm.multimodal.encoder_budget import (
     get_dummy_encoder_profile_inputs,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.signals.capturer import (
+    SignalCapturer,
+    counts_from_cumulative,
+    maybe_build_capturer,
+    rows_to_request_ids,
+)
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -339,6 +345,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
         self.routed_experts_capturer: RoutedExpertsCapturer | None = None
+        self.signal_capturer: SignalCapturer | None = None
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
 
@@ -383,6 +390,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
                 )
+
+            self.signal_capturer = maybe_build_capturer(self.vllm_config, self.model)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
@@ -982,6 +991,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # from the slot index.
         for req_id in sorted(finished_req_ids):
             self._remove_request(req_id)
+        if self.signal_capturer is not None:
+            self.signal_capturer.finish_requests(finished_req_ids)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -1402,6 +1413,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             logits = self.model.compute_logits(sample_hidden_states)
+            if self.signal_capturer is not None:
+                self.signal_capturer.record_logits(logits)
 
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1714,6 +1727,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
+        if self.signal_capturer is not None and not dummy_run:
+            self.signal_capturer.begin_step(
+                rows_to_request_ids(
+                    input_batch.req_ids,
+                    counts_from_cumulative(
+                        input_batch.cu_num_logits_np, input_batch.num_reqs
+                    ),
+                ),
+                input_batch.logits_indices,
+                input_batch.num_tokens_after_padding,
+            )
+
         self.step_timing.forward_start()
 
         # Run model.
@@ -1757,6 +1782,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if self.signal_capturer is not None:
+            self.signal_capturer.disarm()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1844,6 +1872,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+
+        if self.signal_capturer is not None:
+            self.signal_capturer.end_step()
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

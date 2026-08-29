@@ -120,6 +120,11 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
+from vllm.signals.capturer import (
+    SignalCapturer,
+    maybe_build_capturer,
+    rows_to_request_ids,
+)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
@@ -624,6 +629,7 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        self.signal_capturer: SignalCapturer | None = None
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -1211,6 +1217,8 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if self.signal_capturer is not None:
+            self.signal_capturer.finish_requests(scheduler_output.finished_req_ids)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
@@ -4508,6 +4516,17 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if self.signal_capturer is not None and logits_indices is not None:
+                self.signal_capturer.begin_step(
+                    rows_to_request_ids(
+                        self.input_batch.req_ids,
+                        spec_decode_metadata.num_draft_tokens
+                        if spec_decode_metadata is not None
+                        else None,
+                    ),
+                    logits_indices,
+                    num_tokens_padded,
+                )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4515,6 +4534,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if self.signal_capturer is not None:
+                self.signal_capturer.disarm()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4544,6 +4565,8 @@ class GPUModelRunner(
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                if self.signal_capturer is not None:
+                    self.signal_capturer.record_logits(logits)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4648,6 +4671,8 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if self.signal_capturer is not None:
+                self.signal_capturer.end_step()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -5422,6 +5447,9 @@ class GPUModelRunner(
                         eplb_models += 1
 
                 self._setup_eagle3_aux_hidden_state_outputs()
+                self.signal_capturer = maybe_build_capturer(
+                    self.vllm_config, self.model
+                )
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the

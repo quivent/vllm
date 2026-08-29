@@ -69,6 +69,59 @@ class ObservabilityConfig:
     """Enable CUDA graph metrics (number of padded/unpadded tokens, runtime cudagraph
     dispatch modes, and their observed frequencies at every logging interval)."""
 
+    signal_capture_tier: str = "off"
+    """Inference-signal capture tier -- what internal state to record for each
+    request, written as one `sigcap-v1` safetensors deposit per generation.
+    Volume grows roughly 10x per step:
+
+    - `off`: no capture (default).
+    - `logit`: per-token entropy / perplexity / confidence.
+    - `layer_stats`: the above plus per-layer scalar reductions of every signal.
+    - `heads`: per-head scalar reductions.
+    - `residual_raw`: the full residual stream (`l_out`) vector per layer, raw.
+    - `full_raw`: the above plus gate / norms / q / k vectors per layer.
+    - `full_raw_attn`: the above plus attention weights (not supported behind a
+      fused attention kernel; rejected at startup).
+
+    Tiers `t0`-`t6` are accepted as aliases. Any tier above `logit` needs module
+    forward hooks, which forces eager execution -- see `--enforce-eager`.
+    Requires `--signal-capture-dir`."""
+
+    signal_capture_dir: str | None = None
+    """Directory to write signal deposits into, one `<request_id>.safetensors`
+    per generation. Capture is inactive unless this is set."""
+
+    signal_capture_layers: str = "last"
+    """Which decoder layers to tap: `all`, `last`, or a comma-separated list of
+    layer indices (negatives count from the end). Defaults to `last`, which at
+    the `residual_raw` tier makes each generated token cost one hidden-size
+    vector -- about 10 KiB for a 5120-wide model in bf16."""
+
+    signal_capture_layer_step: int = Field(default=1, ge=1)
+    """Record every Nth layer, thinning whatever `--signal-capture-layers`
+    selects."""
+
+    signal_capture_token_step: int = Field(default=1, ge=1)
+    """Record every Nth generated token of each request."""
+
+    signal_capture_dtype: Literal["native", "float32"] = "native"
+    """Storage dtype for raw vectors. `native` keeps the model's activation
+    dtype, so values are stored exactly as they exist in the forward pass;
+    `float32` widens them, matching the reference C++ recorder byte-for-byte."""
+
+    signal_capture_max_bytes: int = Field(default=64 * (1 << 20), ge=0)
+    """Per-request budget for buffered signal data. A request that exceeds it
+    stops recording and is marked `truncated` in its deposit metadata, rather
+    than growing without limit. 0 disables the cap."""
+
+    signal_capture_session: str | None = None
+    """Free-form session label written into deposit metadata, for grouping the
+    deposits of one experiment."""
+
+    @cached_property
+    def signal_capture_enabled(self) -> bool:
+        return self.signal_capture_tier != "off" and bool(self.signal_capture_dir)
+
     enable_layerwise_nvtx_tracing: bool = False
     """Enable layerwise NVTX tracing. This traces the execution of each layer or
     module in the model and attach information such as input/output shapes to
@@ -161,6 +214,34 @@ class ObservabilityConfig:
         if value is not None and len(value) == 1 and "," in value[0]:
             value = cast(list[DetailedTraceModules], value[0].split(","))
         return value
+
+    @field_validator("signal_capture_tier")
+    @classmethod
+    def _validate_signal_capture_tier(cls, value: str) -> str:
+        from vllm.signals.tiers import Tier, tier_from_str
+
+        tier = tier_from_str(value)
+        if tier == Tier.FULL_RAW_ATTN:
+            raise ValueError(
+                "signal_capture_tier='full_raw_attn' (T6) records post-softmax "
+                "attention weights, which fused attention kernels never "
+                "materialize. Use 'full_raw' (T5) for every other forward-pass "
+                "signal."
+            )
+        return tier.wire_name
+
+    @model_validator(mode="after")
+    def _validate_signal_capture(self):
+        from vllm.signals.tiers import Tier, tier_from_str
+
+        if tier_from_str(self.signal_capture_tier) != Tier.OFF and not (
+            self.signal_capture_dir
+        ):
+            raise ValueError(
+                "signal_capture_tier is set but --signal-capture-dir is not; "
+                "there is nowhere to write deposits."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_tracing_config(self):

@@ -1,0 +1,548 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Worker-side inference-signal capture.
+
+Taps the model's forward pass through ``nn.Module`` forward hooks, gathers the
+row belonging to each in-flight request's current token, and accumulates one
+:class:`~vllm.signals.deposit.Deposit` per request. Deposits are written out --
+off the engine thread -- when the request finishes.
+
+Tap points, per SPEC.md 3:
+
+======================  =====================================================
+Signal                  Module tapped
+======================  =====================================================
+``residual``            each decoder layer; ``l_out = hidden_states + residual``
+``attn_norm``           ``layer.input_layernorm``
+``ffn_norm``            ``layer.post_attention_layernorm``
+``gate``                ``layer.mlp.act_fn`` (post-activation, width n_ff)
+``qcur`` / ``kcur``     ``layer.self_attn.rotary_emb`` (post-RoPE Q and K)
+======================  =====================================================
+
+``residual`` uses the same expression as vLLM's own EAGLE-3 auxiliary hidden
+state hook (``EagleModelMixin._maybe_add_hidden_state``): decoder layers carry
+the residual stream alongside the normed activations for fused add+norm, so the
+stream itself is the sum of the two values the layer returns.
+
+Attention weights (``attn``, tier T6) are not capturable behind a fused
+attention kernel; the T6 tier is rejected at startup rather than silently
+recording nothing.
+"""
+
+import os
+import re
+import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+
+import torch
+import torch.nn as nn
+
+from vllm.logger import init_logger
+from vllm.signals import reductions
+from vllm.signals.config import SignalCaptureConfig
+from vllm.signals.deposit import Deposit
+from vllm.signals.tiers import (
+    ALL_SIGNALS,
+    SIG_ATTN_NORM,
+    SIG_FFN_NORM,
+    SIG_GATE,
+    SIG_KCUR,
+    SIG_QCUR,
+    SIG_RESIDUAL,
+    Mode,
+    Tier,
+    mode_for,
+)
+
+logger = init_logger(__name__)
+
+_LAYER_NAME_RE = re.compile(r"^(?P<prefix>.*\.layers)\.(?P<idx>\d+)$")
+
+
+def _first_tensor(value) -> torch.Tensor | None:
+    """Modules in the tap set return either a tensor or a (tensor, ...) tuple."""
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (tuple, list)) and value and torch.is_tensor(value[0]):
+        return value[0]
+    return None
+
+
+def find_decoder_layers(model: nn.Module) -> list[nn.Module]:
+    """Locate the decoder layer stack, without depending on a model class.
+
+    Groups every ``*.layers.<n>`` module by its prefix and returns the largest
+    group, which is the main decoder stack for every vLLM model layout (the
+    smaller groups are drafters, vision towers, and the like).
+    """
+    groups: dict[str, dict[int, nn.Module]] = defaultdict(dict)
+    for name, module in model.named_modules():
+        match = _LAYER_NAME_RE.match(name)
+        if match:
+            groups[match.group("prefix")][int(match.group("idx"))] = module
+    if not groups:
+        return []
+    best = max(groups.values(), key=len)
+    return [best[i] for i in sorted(best)]
+
+
+class SignalCapturer:
+    """Owns the hooks, the per-step staging buffers, and the per-request deposits.
+
+    Lifecycle, driven by the model runner:
+
+    1. :meth:`begin_step` before the forward -- says which rows of the batch to
+       gather and which request each row belongs to.
+    2. hooks fire during the forward, staging gathered rows on device.
+    3. :meth:`end_step` after the forward -- one device->host copy, then rows are
+       filed into each request's deposit.
+    4. :meth:`finish_requests` when requests complete -- deposits are written.
+    """
+
+    def __init__(
+        self,
+        config: SignalCaptureConfig,
+        model: nn.Module,
+        *,
+        model_name: str = "",
+        head_dim: int = 0,
+    ):
+        self.config = config
+        self.model_name = model_name
+        self.head_dim = head_dim
+        self.tier = config.tier
+
+        self.layers = find_decoder_layers(model)
+        if not self.layers:
+            logger.warning(
+                "Signal capture is enabled but no decoder layer stack was found "
+                "on this model; capture is inactive."
+            )
+            self.enabled = False
+            return
+
+        self.tapped_layers = set(config.resolve_layers(len(self.layers)))
+        self.enabled = bool(self.tapped_layers)
+
+        self._deposits: dict[str, Deposit] = {}
+        self._token_counter: dict[str, int] = defaultdict(int)
+        # signal -> layer -> staged rows for the current step.
+        self._staged: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
+        self._pending_q: dict[int, torch.Tensor] = {}
+
+        self._active = False
+        self._row_index: torch.Tensor | None = None
+        self._row_req_ids: list[str] = []
+        self._num_tokens = 0
+        self._staged_logits: torch.Tensor | None = None
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+
+        self._writer = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="signal-deposit"
+        )
+        self._lock = threading.Lock()
+
+        if self.enabled:
+            self._install_hooks()
+            logger.info(
+                "Signal capture active: tier=%s layers=%s (of %d) token_step=%d "
+                "dtype=%s -> %s",
+                self.tier.wire_name,
+                sorted(self.tapped_layers)
+                if len(self.tapped_layers) <= 8
+                else f"{len(self.tapped_layers)} layers",
+                len(self.layers),
+                self.config.token_step,
+                self.config.dtype,
+                self.config.output_dir,
+            )
+
+    # ── hook installation ────────────────────────────────────────────────────
+
+    def _wants(self, signal: str) -> bool:
+        return mode_for(self.tier, signal) is not Mode.DROP
+
+    def _install_hooks(self) -> None:
+        want_residual = self._wants(SIG_RESIDUAL)
+        want_attn_norm = self._wants(SIG_ATTN_NORM)
+        want_ffn_norm = self._wants(SIG_FFN_NORM)
+        want_gate = self._wants(SIG_GATE)
+        want_qk = self._wants(SIG_QCUR) or self._wants(SIG_KCUR)
+
+        missing: set[str] = set()
+        for idx in sorted(self.tapped_layers):
+            layer = self.layers[idx]
+            if want_residual:
+                self._hook(layer, self._make_residual_hook(idx))
+            if want_attn_norm:
+                self._hook_named(layer, "input_layernorm", SIG_ATTN_NORM, idx, missing)
+            if want_ffn_norm:
+                self._hook_named(
+                    layer, "post_attention_layernorm", SIG_FFN_NORM, idx, missing
+                )
+            if want_gate:
+                self._hook_named(layer, "mlp.act_fn", SIG_GATE, idx, missing)
+            if want_qk:
+                rotary = _resolve(layer, "self_attn.rotary_emb")
+                if rotary is None:
+                    missing.add("qcur/kcur")
+                else:
+                    self._hook(rotary, self._make_qk_hook(idx))
+
+        if missing:
+            logger.warning(
+                "Signal capture: no tap point on this architecture for %s; those "
+                "signals will be absent from deposits.",
+                ", ".join(sorted(missing)),
+            )
+
+    def _hook(self, module: nn.Module, fn) -> None:
+        self._handles.append(module.register_forward_hook(fn))
+
+    def _hook_named(
+        self, layer: nn.Module, path: str, signal: str, idx: int, missing: set[str]
+    ) -> None:
+        module = _resolve(layer, path)
+        if module is None:
+            missing.add(signal)
+            return
+        self._hook(module, self._make_simple_hook(signal, idx))
+
+    def _make_residual_hook(self, layer_idx: int):
+        def hook(_module, _args, output):
+            if not self._active:
+                return
+            # Fused add+norm layers return (hidden_states, residual); the residual
+            # stream is their sum. Non-fused layers return the stream directly.
+            if isinstance(output, (tuple, list)) and len(output) >= 2:
+                hidden, residual = output[0], output[1]
+                stream = hidden + residual if residual is not None else hidden
+            else:
+                stream = _first_tensor(output)
+            if stream is not None:
+                self._stage(SIG_RESIDUAL, layer_idx, stream)
+
+        return hook
+
+    def _make_simple_hook(self, signal: str, layer_idx: int):
+        def hook(_module, _args, output):
+            if not self._active:
+                return
+            tensor = _first_tensor(output)
+            if tensor is not None:
+                self._stage(signal, layer_idx, tensor)
+
+        return hook
+
+    def _make_qk_hook(self, layer_idx: int):
+        def hook(_module, _args, output):
+            if not self._active:
+                return
+            if not (isinstance(output, (tuple, list)) and len(output) >= 2):
+                return
+            query, key = output[0], output[1]
+            if isinstance(query, torch.Tensor):
+                self._stage(SIG_QCUR, layer_idx, query)
+            if isinstance(key, torch.Tensor):
+                self._stage(SIG_KCUR, layer_idx, key)
+
+        return hook
+
+    # ── per-step capture ─────────────────────────────────────────────────────
+
+    def _stage(self, signal: str, layer_idx: int, tensor: torch.Tensor) -> None:
+        """Gather the rows of interest out of a [num_tokens, width] activation."""
+        index = self._row_index
+        if index is None or tensor.ndim < 2:
+            return
+        flat = tensor.reshape(tensor.shape[0], -1)
+        if flat.shape[0] < self._num_tokens:
+            # Not a per-token activation of this batch (or a dummy run slipping
+            # through). Checked against a known count so no device sync is needed.
+            return
+        self._staged[signal][layer_idx] = flat.index_select(0, index)
+
+    def begin_step(
+        self, row_req_ids: list[str], row_index: torch.Tensor, num_tokens: int
+    ) -> None:
+        """Arm the hooks for one forward pass.
+
+        Args:
+            row_req_ids: the request id owning each captured row, in row order.
+            row_index: indices into the flattened token batch to gather -- the
+                sampling positions (``logits_indices``).
+            num_tokens: rows in this batch's token dimension, used to tell
+                per-token activations apart from other tensors the hooks see.
+        """
+        if not self.enabled or not row_req_ids:
+            self._active = False
+            return
+        if len(row_req_ids) != row_index.shape[0]:
+            # The row->request mapping disagrees with the gather indices; record
+            # nothing rather than misattribute activations to the wrong request.
+            logger.warning_once(
+                "Signal capture: %d sampling rows but %d request slots; skipping "
+                "capture for this step.",
+                row_index.shape[0],
+                len(row_req_ids),
+            )
+            self._active = False
+            return
+        # token_step thins by each request's own generated-token counter.
+        if self.config.token_step > 1:
+            keep = [
+                i
+                for i, rid in enumerate(row_req_ids)
+                if self._token_counter[rid] % self.config.token_step == 0
+            ]
+            if not keep:
+                self._active = False
+                for rid in row_req_ids:
+                    self._token_counter[rid] += 1
+                return
+            if len(keep) != len(row_req_ids):
+                sel = torch.tensor(keep, device=row_index.device, dtype=torch.long)
+                row_index = row_index.index_select(0, sel)
+                row_req_ids = [row_req_ids[i] for i in keep]
+
+        self._staged.clear()
+        self._pending_q.clear()
+        self._staged_logits = None
+        self._row_req_ids = row_req_ids
+        self._row_index = row_index.to(torch.long)
+        self._num_tokens = num_tokens
+        self._active = True
+
+    def disarm(self) -> None:
+        """Stop the hooks staging, without draining yet.
+
+        Called as soon as the model forward returns, so that any other forward
+        before :meth:`end_step` -- a drafter, a dummy run -- is not recorded.
+        """
+        self._active = False
+
+    def record_logits(self, logits: torch.Tensor) -> None:
+        """Hand over this step's sampling logits for the T1 token metrics."""
+        if self._row_req_ids and self.tier >= Tier.LOGIT:
+            self._staged_logits = logits
+
+    def end_step(self, logits: torch.Tensor | None = None) -> None:
+        """Drain the staged rows into per-request deposits."""
+        if not self._row_req_ids:
+            return
+        self._active = False
+        logits = logits if logits is not None else self._staged_logits
+        row_req_ids = self._row_req_ids
+        tokens = [self._token_counter[rid] for rid in row_req_ids]
+
+        try:
+            if self.tier >= Tier.LAYER_STATS:
+                self._drain_signals(row_req_ids, tokens)
+            if logits is not None:
+                self._drain_logits(row_req_ids, tokens, logits)
+        finally:
+            for rid in row_req_ids:
+                self._token_counter[rid] += 1
+                self._deposit_for(rid).note_token()
+            self._staged.clear()
+            self._pending_q.clear()
+            self._staged_logits = None
+            self._row_index = None
+            self._row_req_ids = []
+
+    def _drain_signals(self, row_req_ids: list[str], tokens: list[int]) -> None:
+        raw_mode = {sig: mode_for(self.tier, sig) is Mode.RAW for sig in self._staged}
+        host: dict[str, tuple[list[int], torch.Tensor]] = {}
+
+        # ALL_SIGNALS order puts qcur before kcur, which the Q-K cosine needs.
+        for signal in [s for s in ALL_SIGNALS if s in self._staged]:
+            per_layer = self._staged[signal]
+            if not per_layer:
+                continue
+            layer_ids = sorted(per_layer)
+            stacked = torch.stack([per_layer[i] for i in layer_ids])
+            if raw_mode[signal]:
+                if self.config.dtype == "float32":
+                    stacked = stacked.float()
+            else:
+                stacked = self._reduce(signal, layer_ids, stacked)
+            # One device->host copy per signal, for the whole step.
+            host[signal] = (layer_ids, stacked.detach().to("cpu", copy=True))
+
+        for signal, (layer_ids, values) in host.items():
+            is_raw = raw_mode[signal]
+            for li, layer_idx in enumerate(layer_ids):
+                for ri, rid in enumerate(row_req_ids):
+                    deposit = self._deposit_for(rid)
+                    row = values[li, ri : ri + 1]
+                    if is_raw:
+                        deposit.add_raw(signal, row, tokens[ri], layer_idx)
+                    else:
+                        deposit.add_stats(signal, row, tokens[ri], layer_idx)
+
+    def _reduce(
+        self, signal: str, layer_ids: list[int], stacked: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the T2/T3 scalar reductions, keeping cross-layer/-tensor pairing."""
+        out = []
+        prev: torch.Tensor | None = None
+        for li, layer_idx in enumerate(layer_ids):
+            rows = stacked[li]
+            pending_q = None
+            if signal == SIG_KCUR:
+                pending_q = self._pending_q.get(layer_idx)
+            stats = reductions.layer_stats(
+                signal,
+                rows,
+                prev_residual=prev if signal == SIG_RESIDUAL else None,
+                pending_q=pending_q,
+                head_dim=self.head_dim,
+            )
+            if signal == SIG_RESIDUAL:
+                prev = rows
+            if signal == SIG_QCUR:
+                self._pending_q[layer_idx] = rows
+            out.append(stats)
+        return torch.stack(out)
+
+    def _drain_logits(
+        self, row_req_ids: list[str], tokens: list[int], logits: torch.Tensor
+    ) -> None:
+        if logits.ndim != 2 or logits.shape[0] < len(row_req_ids):
+            return
+        metrics = reductions.logit_metrics(logits[: len(row_req_ids)])
+        host = metrics.detach().to("cpu", copy=True)
+        for ri, rid in enumerate(row_req_ids):
+            self._deposit_for(rid).add_logits(host[ri : ri + 1], tokens[ri])
+
+    # ── request lifecycle ────────────────────────────────────────────────────
+
+    def _deposit_for(self, request_id: str) -> Deposit:
+        deposit = self._deposits.get(request_id)
+        if deposit is None:
+            deposit = Deposit(
+                request_id,
+                tier=self.tier,
+                layer_step=self.config.layer_step,
+                token_step=self.config.token_step,
+                model=self.model_name,
+                session=self.config.session,
+                max_bytes=self.config.max_bytes,
+            )
+            self._deposits[request_id] = deposit
+        return deposit
+
+    def finish_requests(self, request_ids) -> None:
+        """Write and retire the deposits for finished requests."""
+        if not self.enabled:
+            return
+        for rid in request_ids:
+            deposit = self._deposits.pop(rid, None)
+            self._token_counter.pop(rid, None)
+            if deposit is None or deposit.is_empty:
+                continue
+            path = os.path.join(
+                self.config.output_dir, f"{_safe_name(rid)}.safetensors"
+            )
+            self._writer.submit(self._write, deposit, path)
+
+    def _write(self, deposit: Deposit, path: str) -> None:
+        try:
+            written = deposit.write(path)
+            if written:
+                logger.debug(
+                    "Wrote signal deposit %s (%d tokens, %.1f KiB)",
+                    written,
+                    deposit.num_tokens,
+                    deposit.nbytes / 1024,
+                )
+        except Exception:
+            logger.exception("Failed to write signal deposit to %s", path)
+
+    def shutdown(self) -> None:
+        """Flush in-flight deposits and remove the hooks."""
+        if not getattr(self, "enabled", False):
+            return
+        self.finish_requests(list(self._deposits))
+        self._writer.shutdown(wait=True)
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self.enabled = False
+
+
+def _resolve(root: nn.Module, path: str) -> nn.Module | None:
+    node: nn.Module | None = root
+    for part in path.split("."):
+        node = getattr(node, part, None)
+        if node is None:
+            return None
+    return node
+
+
+def _safe_name(request_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", request_id)[:180]
+
+
+def rows_to_request_ids(req_ids: list[str], counts=None) -> list[str]:
+    """Map each sampling row back to the request that owns it.
+
+    One row per request in the ordinary case. Speculative decoding verifies
+    several draft positions per request per step, so a request then owns
+    ``counts[i]`` consecutive rows.
+
+    Args:
+        req_ids: the batch's requests, in row order.
+        counts: rows per request, or None for one row each.
+    """
+    if counts is None:
+        return list(req_ids)
+    if len(counts) != len(req_ids):
+        return list(req_ids)
+    out: list[str] = []
+    for rid, count in zip(req_ids, counts):
+        out.extend([rid] * int(count))
+    return out
+
+
+def counts_from_cumulative(cu_num_logits_np, num_reqs: int):
+    """Per-request row counts from a cumulative-offset array, or None."""
+    if cu_num_logits_np is None or len(cu_num_logits_np) < num_reqs + 1:
+        return None
+    return [int(cu_num_logits_np[i + 1] - cu_num_logits_np[i]) for i in range(num_reqs)]
+
+
+def maybe_build_capturer(vllm_config, model: nn.Module) -> "SignalCapturer | None":
+    """Construct a capturer if signal capture is configured and supported here.
+
+    Returns None when capture is off, or when this process is not the rank that
+    should be writing deposits.
+    """
+    observability = vllm_config.observability_config
+    if not observability.signal_capture_enabled:
+        return None
+
+    if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        logger.warning(
+            "Signal capture is not supported with pipeline parallelism "
+            "(each rank holds only part of the layer stack); capture is off."
+        )
+        return None
+
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    try:
+        if get_tensor_model_parallel_rank() != 0:
+            return None
+    except Exception:
+        pass
+
+    model_config = vllm_config.model_config
+    head_dim = getattr(model_config, "get_head_size", lambda: 0)() or 0
+    return SignalCapturer(
+        SignalCaptureConfig.from_observability(observability),
+        model,
+        model_name=model_config.model if model_config is not None else "",
+        head_dim=head_dim,
+    )

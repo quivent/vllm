@@ -668,6 +668,22 @@ class EngineArgs:
         ObservabilityConfig, "kv_cache_metrics_sample"
     )
     cudagraph_metrics: bool = ObservabilityConfig.cudagraph_metrics
+    signal_capture_tier: str = ObservabilityConfig.signal_capture_tier
+    signal_capture_dir: str | None = ObservabilityConfig.signal_capture_dir
+    signal_capture_layers: str = ObservabilityConfig.signal_capture_layers
+    signal_capture_layer_step: int = get_field(
+        ObservabilityConfig, "signal_capture_layer_step"
+    )
+    signal_capture_token_step: int = get_field(
+        ObservabilityConfig, "signal_capture_token_step"
+    )
+    signal_capture_dtype: Literal["native", "float32"] = (
+        ObservabilityConfig.signal_capture_dtype
+    )
+    signal_capture_max_bytes: int = get_field(
+        ObservabilityConfig, "signal_capture_max_bytes"
+    )
+    signal_capture_session: str | None = ObservabilityConfig.signal_capture_session
     enable_layerwise_nvtx_tracing: bool = (
         ObservabilityConfig.enable_layerwise_nvtx_tracing
     )
@@ -1507,6 +1523,37 @@ class EngineArgs:
             **observability_kwargs["cudagraph_metrics"],
         )
         observability_group.add_argument(
+            "--signal-capture-tier",
+            **observability_kwargs["signal_capture_tier"],
+        )
+        observability_group.add_argument(
+            "--signal-capture-dir", **observability_kwargs["signal_capture_dir"]
+        )
+        observability_group.add_argument(
+            "--signal-capture-layers",
+            **observability_kwargs["signal_capture_layers"],
+        )
+        observability_group.add_argument(
+            "--signal-capture-layer-step",
+            **observability_kwargs["signal_capture_layer_step"],
+        )
+        observability_group.add_argument(
+            "--signal-capture-token-step",
+            **observability_kwargs["signal_capture_token_step"],
+        )
+        observability_group.add_argument(
+            "--signal-capture-dtype",
+            **observability_kwargs["signal_capture_dtype"],
+        )
+        observability_group.add_argument(
+            "--signal-capture-max-bytes",
+            **observability_kwargs["signal_capture_max_bytes"],
+        )
+        observability_group.add_argument(
+            "--signal-capture-session",
+            **observability_kwargs["signal_capture_session"],
+        )
+        observability_group.add_argument(
             "--enable-layerwise-nvtx-tracing",
             **observability_kwargs["enable_layerwise_nvtx_tracing"],
         )
@@ -1957,6 +2004,14 @@ class EngineArgs:
             kv_cache_metrics=self.kv_cache_metrics,
             kv_cache_metrics_sample=self.kv_cache_metrics_sample,
             cudagraph_metrics=self.cudagraph_metrics,
+            signal_capture_tier=self.signal_capture_tier,
+            signal_capture_dir=self.signal_capture_dir,
+            signal_capture_layers=self.signal_capture_layers,
+            signal_capture_layer_step=self.signal_capture_layer_step,
+            signal_capture_token_step=self.signal_capture_token_step,
+            signal_capture_dtype=self.signal_capture_dtype,
+            signal_capture_max_bytes=self.signal_capture_max_bytes,
+            signal_capture_session=self.signal_capture_session,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,

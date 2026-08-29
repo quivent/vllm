@@ -82,6 +82,43 @@ than one per turn. On a 5120-wide model that is 10 KiB × every token — a
 silently recording the wrong thing — T3's per-head reduction is unimplemented,
 and T6 needs attention weights that fused attention kernels never materialize.
 
+## Shipping deposits to R2
+
+A sidecar, outside the engine, so a slow upload can never slow a forward pass:
+
+```bash
+python -m vllm.signals.r2 --dir /var/signals sync     # upload the backlog, exit
+python -m vllm.signals.r2 --dir /var/signals watch    # and keep going
+python -m vllm.signals.r2 --dir /var/signals catalog  # what has been shipped
+```
+
+Uploads go through `gemstone store push` by default, reusing the credentials
+and bucket that CLI already has, so this needs no secrets of its own. `--backend
+s3` uses boto3 against the R2 endpoint from `~/.council-r2.env` instead, which
+is faster for a large backlog and is the only backend that sets object
+metadata.
+
+Objects are grouped so a day's turns, or one experiment's, come back with a
+single prefix:
+
+```
+signals/<model>/<session>/<YYYY-MM-DD>/<timestamp>-<request_id>.safetensors
+signals/_catalog/<YYYY-MM-DD>.jsonl
+```
+
+Every upload appends a catalog row — key, sha256, bytes, model, session,
+request id, tier, token reduction, captured positions, truncated flag, and both
+timestamps — to a daily JSONL shard held locally and mirrored to the bucket. The
+set of captured turns can then be queried without listing several hundred
+thousand objects.
+
+Uploads are idempotent: shipped basenames are recorded in `.r2-uploaded.json`
+in the capture directory, so a restart resumes rather than re-uploading, and a
+failed upload is simply left unrecorded for the next pass to retry. Deposits
+are written atomically by the capture side, so the watcher never sees a
+half-written file. `--delete-after` removes each local copy once it is safely
+in the bucket; by default nothing is deleted.
+
 ## Reading a deposit
 
 ```bash
@@ -194,27 +231,44 @@ straight into `--signal-inject-from`. `--normalize` scales to unit norm so
 
 ## Costs
 
-**Capture above `logit` forces eager execution.** Forward hooks are captured
-into a CUDA graph and then never re-run on replay, so deposits would silently
-go empty after warmup. The patch enables `enforce_eager` and says so in the
-log. Injection forces it too, for the same reason.
+**Capture above `logit` forces eager execution, and on this setup that costs
+about 4x throughput.** Forward hooks are captured into a CUDA graph and then
+never re-run on replay, so deposits would silently go empty after warmup. The
+patch enables `enforce_eager` and says so in the log. Injection forces it too.
 
-Measured on Qwen3.8-27B INT4 (GH200, MTP spec decode, 48 prompts, concurrency
-8, 256 in / 128 out):
+Measured on Qwen3.8-27B INT4 (GH200, MTP speculative decoding with 3 draft
+tokens, 48 prompts, concurrency 8, 256 in / 128 out):
 
-| configuration | output tok/s | mean TPOT |
-|---|---|---|
-| eager, hooks installed, tier `off` | 181.1 | 39.9 ms |
-| eager, recording, `layers=last` | 161.8 | 41.3 ms |
-| eager, recording, `layers=all` (64) | 164.3 | 43.9 ms |
+| configuration | output tok/s | mean TPOT | vs baseline |
+|---|---|---|---|
+| CUDA graphs, no capture | **737.6** | 9.3 ms | — |
+| eager, hooks installed, tier `off` | 181.1 | 39.9 ms | **0.25x** |
+| eager, recording, `layers=last` | 161.8 | 41.3 ms | **0.22x** |
+| eager, recording, `layers=all` (64) | 164.3 | 43.9 ms | **0.22x** |
 
-The two recording rows are within noise of each other, which is the useful
-finding: recording all 64 layers costs about the same as recording one, because
-the expense is the hook and the device→host copy per step, not the volume.
+Read that carefully before turning capture on in front of traffic. Nearly all
+of the loss is eager itself, not the recording: going from hooks-idle to
+recording all 64 layers costs another ~10%, because the expense is the hook and
+the per-step device→host copy, not the volume of data. Speculative decoding
+makes the gap worse than it would otherwise be — MTP runs several forwards per
+step, and CUDA graphs are what amortize the launch overhead of those.
 
-Eager also *removes* a large startup cost on this setup: the CUDA-graph path
-spends ~17 minutes capturing 83 graph sizes (host-bound, one core pinned),
-against ~83 seconds to serve in eager.
+Practical consequences:
+
+- The `logit` tier installs no hooks and does **not** force eager, so it runs at
+  full speed. It is the only tier that is free.
+- Everything else is a capture *window*, not a steady state. Launch with
+  `--signal-capture-max-tier` and `--signal-capture-tier off` and you still pay
+  the 4x, because the ceiling is what forces eager — the runtime switch buys
+  you control over *what* is recorded, not over the throughput cost.
+- Eager does start much faster: ~83 seconds to serve, against ~17 minutes for
+  the graphs path to capture 83 graph sizes on this box. That is a real
+  convenience for short experiments, and no consolation for a production
+  server.
+
+Making capture graph-compatible — hooks writing into preallocated buffers with
+pure tensor ops, which a graph can capture and replay — would remove most of
+this. It is not done.
 
 ## Limitations
 

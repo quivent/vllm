@@ -1,0 +1,67 @@
+{
+  "metadata": {
+    "model": "/home/ubuntu/models/RedHatAI/Qwen3.8-27B-INT4",
+    "format": "sigcap-v1",
+    "created_at": "1788032751.261",
+    "token_reduce": "last",
+    "layer_step": "1",
+    "session": "",
+    "engine": "vllm",
+    "num_captured_positions": "85",
+    "dtypes": "bfloat16,float32",
+    "truncated": "false",
+    "tier": "residual_raw",
+    "token_step": "1",
+    "request_id": "chatcmpl-a0a15b1accf9a731-874fdcaf"
+  },
+  "tensors": {
+    "logit": {
+      "shape": [
+        1,
+        3
+      ],
+      "dtype": "F32"
+    },
+    "logit.index": {
+      "shape": [
+        1,
+        1
+      ],
+      "dtype": "F32"
+    },
+    "residual.index": {
+      "shape": [
+        1,
+        2
+      ],
+      "dtype": "F32"
+    },
+    "residual": {
+      "shape": [
+        1,
+        5120
+      ],
+      "dtype": "BF16"
+    }
+  },
+  "stats": {
+    "residual": [
+      {
+        "token": 81,
+        "layer_idx": 63,
+        "activation_norm": 349.8942565917969,
+        "cosine_sim": 0.0,
+        "mean_abs": 3.621006488800049,
+        "max_abs": 61.5
+      }
+    ],
+    "logit": [
+      {
+        "token": 81,
+        "entropy": 1.0623738765716553,
+        "perplexity": 2.89323091506958,
+        "confidence": 0.5964308977127075
+      }
+    ]
+  }
+}

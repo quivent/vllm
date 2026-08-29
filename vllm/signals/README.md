@@ -1,8 +1,9 @@
 # Inference-signal capture and injection
 
-> **Status, 2026-08-29 — graph backend + MTP speculative decoding: WORKING on
-> Qwen3.8-27B-INT4 (H200).** Residual captured with CUDA graphs on, eager not
-> forced, MTP untouched. Proof below.
+> **Status, 2026-08-29 — graph backend + MTP speculative decoding: WORKING and
+> MEASURED on Qwen3.8-27B-INT4 (H200).** Residual captured with CUDA graphs on,
+> eager not forced, MTP untouched, at a **1.7% throughput cost**
+> (723.8 vs 736.1 tok/s). Proof below.
 
 A private patch to vLLM that does two things:
 
@@ -14,6 +15,10 @@ A private patch to vLLM that does two things:
 Ported from the [`signal-extraction`](https://github.com/quivent) taxonomy; the
 on-disk format is the same `sigcap-v1` safetensors layout that repo's C++
 recorder writes, so deposits from either engine read with the same tools.
+
+**Task-oriented guide: [USAGE.md](USAGE.md)** — get residuals, view them, build
+and inject vectors. **Handover: [HANDOVER.md](HANDOVER.md)**. **Deploy:
+[deploy/H200.md](deploy/H200.md)**.
 
 ## What you get
 
@@ -291,50 +296,47 @@ different things:
 Capture now owns its own flag, tells the graph manager to expect the tuple, and
 leaves the speculator's view untouched.
 
-## Costs
+## Costs — measured
 
-**This applies to the `hook` backend only.** The `graph` backend keeps CUDA
-graphs and does not pay it — see the verified configuration above. Use `graph`
-unless you need a signal other than the residual.
+**With the `graph` backend, capture costs about 1.7%.** With the `hook` backend
+it costs about 4x. That is the whole reason the graph backend exists.
 
-**The hook backend forces eager execution, and on this setup that costs about
-4x throughput.** Forward hooks are captured into a CUDA graph and then
-never re-run on replay, so deposits would silently go empty after warmup. The
-patch enables `enforce_eager` and says so in the log. Injection forces it too.
+Qwen3.8-27B-INT4, MTP with 3 draft tokens, 48 prompts, concurrency 8,
+256 in / 128 out.
 
-Measured on Qwen3.8-27B INT4 (GH200, MTP speculative decoding with 3 draft
-tokens, 48 prompts, concurrency 8, 256 in / 128 out):
+**H200 NVL — graph backend, CUDA graphs on throughout:**
 
-| configuration | output tok/s | mean TPOT | vs baseline |
+| configuration | output tok/s | mean TPOT | cost |
 |---|---|---|---|
-| CUDA graphs, no capture | **737.6** | 9.3 ms | — |
-| eager, hooks installed, tier `off` | 181.1 | 39.9 ms | **0.25x** |
-| eager, recording, `layers=last` | 161.8 | 41.3 ms | **0.22x** |
-| eager, recording, `layers=all` (64) | 164.3 | 43.9 ms | **0.22x** |
+| graph backend, capture **off** | 736.1 | 9.25 ms | — |
+| graph backend, **recording** | **723.8** | 9.31 ms | **1.7%** |
 
-Read that carefully before turning capture on in front of traffic. Nearly all
-of the loss is eager itself, not the recording: going from hooks-idle to
-recording all 64 layers costs another ~10%, because the expense is the hook and
-the per-step device→host copy, not the volume of data. Speculative decoding
-makes the gap worse than it would otherwise be — MTP runs several forwards per
-step, and CUDA graphs are what amortize the launch overhead of those.
+**GH200 — hook backend, which forces eager:**
+
+| configuration | output tok/s | mean TPOT | vs graphs |
+|---|---|---|---|
+| CUDA graphs, no capture | 737.6 | 9.3 ms | — |
+| eager, hooks idle | 181.1 | 39.9 ms | 0.25x |
+| eager, recording | 161.8 | 41.3 ms | 0.22x |
+
+Read the two tables together. Nearly all of the hook backend's loss is *eager*,
+not the recording — hooks idle already cost 4x. The graph backend removes that
+entirely by reading the residual as a model output rather than reaching in with
+a hook, leaving only the aux computation and one device→host copy per step:
+1.7%.
+
+Note the tok/s figures are aggregate across 8 concurrent streams. Single-stream
+decode is the TPOT column — ~108 tok/s per stream at 9.3 ms.
 
 Practical consequences:
 
-- The `logit` tier installs no hooks and does **not** force eager, so it runs at
-  full speed. It is the only tier that is free.
-- Everything else is a capture *window*, not a steady state. Launch with
-  `--signal-capture-max-tier` and `--signal-capture-tier off` and you still pay
-  the 4x, because the ceiling is what forces eager — the runtime switch buys
-  you control over *what* is recorded, not over the throughput cost.
-- Eager does start much faster: ~83 seconds to serve, against ~17 minutes for
-  the graphs path to capture 83 graph sizes on this box. That is a real
-  convenience for short experiments, and no consolation for a production
-  server.
-
-Making capture graph-compatible — hooks writing into preallocated buffers with
-pure tensor ops, which a graph can capture and replay — would remove most of
-this. It is not done.
+- Use `graph` in front of traffic. Capture is effectively free.
+- Use `hook` only for signals other than the residual, and treat it as a
+  capture *window* rather than a steady state.
+- The `logit` tier installs no hooks and never forces eager, whichever backend.
+- Startup differs sharply by host, not by capture: 83 CUDA graphs capture at
+  ~1.3/s on the H200's x86 cores and ~1 per 12.3 s on Grace — ~4 minutes versus
+  ~17. It is host-bound single-thread work.
 
 ## Limitations
 

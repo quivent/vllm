@@ -22,14 +22,15 @@ what is proven, what is not, and every trap that cost time.
 | `graph` backend keeps CUDA graphs (no eager) | **proven** | Qwen3-0.6B and 27B |
 | `graph` backend + MTP speculative decoding | **proven** | H200, see §2 |
 | Hook backend costs ~4x throughput | **proven** | 737.6 → 161.8 tok/s, GH200 |
-| **`graph` backend's throughput cost** | **UNKNOWN** | never benchmarked — see §6 |
+| `graph` backend's throughput cost | **measured: 1.7%** | 723.8 vs 736.1 tok/s, H200 |
 | Injection changes generation | **unit-tested only** | never run on a real model |
 | `graph` backend with EAGLE-3/DFlash drafters | **not tried** | code path exists, see §4 |
 | Tensor parallelism | **not tried** | rank 0 only; sharded signals would be partial |
 
-**The single most important gap:** nobody has measured what the graph backend
-costs. It removes the eager penalty, which was the 4x — but the aux computation
-and the device→host copy are not free, and that number does not exist yet.
+**That gap is now closed.** The graph backend costs **1.7%** (723.8 tok/s
+recording vs 736.1 with capture off, both with CUDA graphs on). The hook
+backend costs ~4x. Capture in front of traffic is a solved problem; use
+`--signal-capture-backend graph`.
 
 ---
 
@@ -143,8 +144,8 @@ they do publish. **DFlash2 is the case to watch** — it is in that list.
 ### H200 NVL `154.54.100.100` (x86_64, driver 580 — CUDA 13 native)
 - **Serving** `qwen38` on :8001, graph backend + MTP, capture recording to
   `~/signals`. Launcher: `~/start-qwen-graph.sh`.
-- **Benchmark staged but never run:** `bash ~/h200bench.sh` — A/B of recording
-  vs `tier off`, both with graphs on. This produces the missing number in §1.
+- **Benchmarked:** `bash ~/h200bench.sh` → recording 723.8 tok/s vs 736.1 with
+  capture off, both with CUDA graphs on. 1.7%.
 - **A Gemma-4-31B governor stack was stopped to free the GPU.** Restore:
   ```bash
   sudo docker start vllm-gemma4-fp8-h200
@@ -178,12 +179,9 @@ into a startup, as something that looks unrelated.
 
 ## 8. What to do next, in order
 
-1. **Run `~/h200bench.sh`.** One command, fills the only unknown that matters:
-   what capture costs with the graph backend. Everything else is guesswork until
-   this exists.
-2. **Fix the bench spec detector** (§5). A verification tool that lies about one
+1. **Fix the bench spec detector** (§5). A verification tool that lies about one
    field undermines the eleven it gets right.
-3. **Try injection on a real model.** It is unit-tested and has never touched a
+2. **Try injection on a real model.** It is unit-tested and has never touched a
    GPU. `POST /signals/inject` with a sample from `samples/`.
 4. **Materialize the R2 model copy** (§5) so provisioning stops depending on HF.
 5. Then, if wanted: capture the MTP drafter's own residual (its

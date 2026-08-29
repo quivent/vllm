@@ -153,9 +153,11 @@ class Deposit:
         session: str = "",
         max_bytes: int = 0,
         token_reduce: str = "all",
+        rope_phase: str = "post",
     ):
         self.request_id = request_id
         self.token_reduce = token_reduce
+        self.rope_phase = rope_phase
         self.tier = tier
         self.layer_step = layer_step
         self.token_step = token_step
@@ -221,6 +223,11 @@ class Deposit:
         self.nbytes += self._logits.append(rows, token, 0)
 
     def note_token(self) -> None:
+        """Count one captured position.
+
+        With speculative decoding a step verifies several draft positions per
+        request, so this counts verified positions, not accepted output tokens.
+        """
         self.num_tokens += 1
 
     @staticmethod
@@ -252,10 +259,11 @@ class Deposit:
             "layer_step": str(self.layer_step),
             "token_step": str(self.token_step),
             "token_reduce": self.token_reduce,
+            "rope_phase": self.rope_phase,
             "model": self.model,
             "session": self.session,
             "request_id": self.request_id,
-            "num_tokens": str(self.num_tokens),
+            "num_captured_positions": str(self.num_tokens),
             "dtypes": ",".join(sorted(dtypes)),
             "truncated": "true" if self.truncated else "false",
             "created_at": f"{self.created_at:.3f}",

@@ -103,6 +103,13 @@ class FakeModel(nn.Module):
         return self.model(x)
 
 
+def deposit_path(directory, request_id):
+    """Deposits are named `<timestamp>-<request_id>.safetensors`."""
+    matches = sorted(directory.glob(f"*-{request_id}.safetensors"))
+    assert matches, f"no deposit for {request_id} in {list(directory.iterdir())}"
+    return matches[-1]
+
+
 def read_deposit(path):
     with open(path, "rb") as f:
         header_len = struct.unpack("<Q", f.read(8))[0]
@@ -137,13 +144,12 @@ def test_residual_raw_deposit_is_one_vector_per_token(tmp_path):
     capturer.finish_requests(["req-a"])
     capturer.shutdown()
 
-    path = tmp_path / "req-a.safetensors"
-    assert path.exists()
+    path = deposit_path(tmp_path, "req-a")
     metadata, header = read_deposit(path)
 
     assert metadata["format"] == "sigcap-v1"
     assert metadata["tier"] == "residual_raw"
-    assert metadata["num_tokens"] == "5"
+    assert metadata["num_captured_positions"] == "5"
     assert metadata["truncated"] == "false"
 
     # Default layer selector is "last": one row per token, from one layer.
@@ -162,14 +168,14 @@ def test_residual_raw_all_layers(tmp_path):
     capturer.finish_requests(["r0", "r1"])
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r0.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r0"))
     # 3 tokens x 4 layers.
     assert header["residual"]["shape"] == [3 * N_LAYERS, HIDDEN]
 
     # Index tensor carries the (token, layer) coordinate of every row.
     from safetensors.torch import load_file
 
-    index = load_file(tmp_path / "r0.safetensors")["residual.index"]
+    index = load_file(deposit_path(tmp_path, "r0"))["residual.index"]
     assert sorted(index[:, 0].tolist()) == sorted([t for t in range(3)] * N_LAYERS)
     assert sorted(set(index[:, 1].tolist())) == list(range(N_LAYERS))
 
@@ -189,7 +195,7 @@ def test_native_dtype_halves_the_deposit(tmp_path):
             capturer.end_step()
         capturer.finish_requests(["r"])
         capturer.shutdown()
-        _, header = read_deposit(out / "r.safetensors")
+        _, header = read_deposit(deposit_path(out, "r"))
         start, end = header["residual"]["data_offsets"]
         sizes[dtype] = end - start
 
@@ -207,7 +213,7 @@ def test_full_raw_captures_every_forward_signal(tmp_path):
     capturer.finish_requests(["r"])
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     rows = 2 * N_LAYERS
     assert header["residual"]["shape"] == [rows, HIDDEN]
     assert header["attn_norm"]["shape"] == [rows, HIDDEN]
@@ -227,7 +233,7 @@ def test_layer_stats_tier_writes_scalar_tuples(tmp_path):
     capturer.finish_requests(["r"])
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     rows = 3 * N_LAYERS
     assert header["stats.residual"]["shape"] == [rows, STATS_WIDTH]
     assert header["stats.gate"]["shape"] == [rows, STATS_WIDTH]
@@ -245,7 +251,7 @@ def test_token_step_thins_the_capture(tmp_path):
     capturer.finish_requests(["r"])
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     assert header["residual"]["shape"] == [3, HIDDEN]  # tokens 0, 3, 6
 
 
@@ -262,7 +268,7 @@ def test_max_bytes_truncates_rather_than_growing(tmp_path):
     capturer.finish_requests(["r"])
     capturer.shutdown()
 
-    metadata, header = read_deposit(tmp_path / "r.safetensors")
+    metadata, header = read_deposit(deposit_path(tmp_path, "r"))
     assert metadata["truncated"] == "true"
     assert header["residual"]["shape"][0] == 3
 
@@ -279,8 +285,8 @@ def test_two_requests_get_separate_deposits(tmp_path):
     capturer.finish_requests(["beta"])
     capturer.shutdown()
 
-    _, alpha = read_deposit(tmp_path / "alpha.safetensors")
-    _, beta = read_deposit(tmp_path / "beta.safetensors")
+    _, alpha = read_deposit(deposit_path(tmp_path, "alpha"))
+    _, beta = read_deposit(deposit_path(tmp_path, "beta"))
     assert alpha["residual"]["shape"] == [4, HIDDEN]
     assert beta["residual"]["shape"] == [6, HIDDEN]
 
@@ -299,7 +305,7 @@ def test_hooks_are_inert_outside_a_step(tmp_path):
     capturer.finish_requests(["r"])
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     assert header["residual"]["shape"] == [2, HIDDEN]
 
 
@@ -415,7 +421,7 @@ def test_shutdown_flushes_requests_that_never_got_a_final_step(tmp_path):
 
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "never-reported.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "never-reported"))
     assert header["residual"]["shape"] == [3, HIDDEN]
 
 
@@ -431,7 +437,7 @@ def test_shutdown_is_idempotent(tmp_path):
     capturer.shutdown()
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     assert header["residual"]["shape"] == [2, HIDDEN]
 
 
@@ -449,7 +455,7 @@ def _turn_deposit(tmp_path, tokens, n_steps=5, layers="last"):
     capturer = SignalCapturer(config, model, model_name="fake")
     run_steps(capturer, model, ["turn"], n_steps=n_steps)
     capturer.shutdown()
-    return read_deposit(tmp_path / "turn.safetensors")
+    return read_deposit(deposit_path(tmp_path, "turn"))
 
 
 @pytest.mark.parametrize("tokens", ["last", "first", "mean"])
@@ -457,7 +463,7 @@ def test_a_turn_is_one_vector_regardless_of_response_length(tmp_path, tokens):
     metadata, header = _turn_deposit(tmp_path, tokens, n_steps=40)
     assert header["residual"]["shape"] == [1, HIDDEN]
     assert metadata["token_reduce"] == tokens
-    assert metadata["num_tokens"] == "40"
+    assert metadata["num_captured_positions"] == "40"
 
 
 def test_deposit_size_is_flat_in_response_length(tmp_path):
@@ -471,7 +477,7 @@ def test_last_keeps_the_final_token(tmp_path):
     metadata, header = _turn_deposit(tmp_path, "last", n_steps=6)
     from safetensors.torch import load_file
 
-    index = load_file(tmp_path / "turn.safetensors")["residual.index"]
+    index = load_file(deposit_path(tmp_path, "turn"))["residual.index"]
     assert index[0, 0].item() == 5  # tokens 0..5, the last one
 
 
@@ -479,7 +485,7 @@ def test_first_keeps_the_opening_token(tmp_path):
     _turn_deposit(tmp_path, "first", n_steps=6)
     from safetensors.torch import load_file
 
-    index = load_file(tmp_path / "turn.safetensors")["residual.index"]
+    index = load_file(deposit_path(tmp_path, "turn"))["residual.index"]
     assert index[0, 0].item() == 0
 
 
@@ -505,7 +511,7 @@ def test_mean_averages_the_turn(tmp_path):
 
     from safetensors.torch import load_file
 
-    stored = load_file(tmp_path / "turn.safetensors")["residual"].float()
+    stored = load_file(deposit_path(tmp_path, "turn"))["residual"].float()
     torch.testing.assert_close(stored, torch.cat(seen).mean(0, keepdim=True))
 
 
@@ -543,7 +549,7 @@ def test_off_tier_records_nothing_then_switching_on_records(tmp_path):
     run_steps(capturer, model, ["r"], n_steps=4)
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     assert header["residual"]["shape"] == [4 * N_LAYERS, HIDDEN]
 
 
@@ -556,7 +562,7 @@ def test_switching_off_again_stops_recording(tmp_path):
     run_steps(capturer, model, ["r"], n_steps=10)
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     assert header["residual"]["shape"] == [2 * N_LAYERS, HIDDEN]
 
 
@@ -576,7 +582,7 @@ def test_runtime_tier_change_swaps_which_signals_are_recorded(tmp_path):
     run_steps(capturer, model, ["r"], n_steps=1)
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     # residual spans both steps; the rest only appear after the tier went up.
     assert header["residual"]["shape"][0] == 2 * N_LAYERS
     assert header["gate"]["shape"][0] == 1 * N_LAYERS
@@ -597,7 +603,8 @@ def test_status_reports_the_live_configuration(tmp_path):
     assert status["tier"] == "logit"
     assert status["max_tier"] == "full_raw"
     assert status["num_layers"] == N_LAYERS
-    assert status["tapped_layers"] == list(range(N_LAYERS))
+    assert status["layers"] == list(range(N_LAYERS))
+    assert status["hooked_layers"] == list(range(N_LAYERS))
 
 
 def test_token_metrics_follow_the_same_reduction(tmp_path):
@@ -615,9 +622,9 @@ def test_token_metrics_follow_the_same_reduction(tmp_path):
             model(torch.randn(1, HIDDEN))
             capturer.end_step(logits=torch.randn(1, 512))
         capturer.shutdown()
-        _, header = read_deposit(out / "r.safetensors")
+        _, header = read_deposit(deposit_path(out, "r"))
         assert header["logit"]["shape"] == [1, 3]
-        sizes[n_steps] = (out / "r.safetensors").stat().st_size
+        sizes[n_steps] = deposit_path(out, "r").stat().st_size
 
     assert sizes[5] == sizes[100], "deposit size still grows with turn length"
 
@@ -634,7 +641,7 @@ def test_all_reduction_keeps_every_token_metric(tmp_path):
         capturer.end_step(logits=torch.randn(1, 512))
     capturer.shutdown()
 
-    _, header = read_deposit(tmp_path / "r.safetensors")
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
     assert header["logit"]["shape"] == [7, 3]
 
 
@@ -648,5 +655,37 @@ def test_startup_warmup_requests_are_not_recorded(tmp_path):
     run_steps(capturer, model, ["_warmup_2_", "real-req"], n_steps=2)
     capturer.shutdown()
 
-    written = sorted(p.name for p in tmp_path.glob("*.safetensors"))
+    written = sorted(p.name.split("-", 1)[1] for p in tmp_path.glob("*.safetensors"))
     assert written == ["real-req.safetensors"]
+
+
+def test_every_turn_is_kept_as_its_own_deposit(tmp_path):
+    """History, not a rolling file: N turns leave N deposits."""
+    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+
+    for turn in range(5):
+        run_steps(capturer, model, [f"turn-{turn}"], n_steps=3)
+        capturer.finish_requests([f"turn-{turn}"])
+    capturer.shutdown()
+
+    deposits = sorted(tmp_path.glob("*.safetensors"))
+    assert len(deposits) == 5
+    # Names sort chronologically, and each carries its own request id.
+    assert [p.name.split("-", 1)[1] for p in deposits] == [
+        f"turn-{i}.safetensors" for i in range(5)
+    ]
+
+
+def test_a_reused_request_id_does_not_clobber_an_earlier_turn(tmp_path):
+    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+
+    for _ in range(3):
+        run_steps(capturer, model, ["same-id"], n_steps=2)
+        capturer.finish_requests(["same-id"])
+    capturer.shutdown()
+
+    assert len(list(tmp_path.glob("*.safetensors"))) == 3

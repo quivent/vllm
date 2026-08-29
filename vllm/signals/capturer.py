@@ -33,6 +33,7 @@ import atexit
 import os
 import re
 import threading
+import time
 import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -60,6 +61,8 @@ from vllm.signals.tiers import (
 )
 
 logger = init_logger(__name__)
+
+_SIG_QKV = "_qkv"
 
 _LAYER_NAME_RE = re.compile(r"^(?P<prefix>.*\.layers)\.(?P<idx>\d+)$")
 
@@ -111,10 +114,15 @@ class SignalCapturer:
         *,
         model_name: str = "",
         head_dim: int = 0,
+        num_heads: int = 0,
+        num_kv_heads: int = 0,
     ):
         self.config = config
         self.model_name = model_name
         self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.rope_phase = "post"
         self.tier = config.tier
         self.max_tier = config.max_tier
 
@@ -143,6 +151,7 @@ class SignalCapturer:
         self._row_req_ids: list[str] = []
         self._num_tokens = 0
         self._staged_logits: torch.Tensor | None = None
+        self._silent_checked = False
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
 
         self._writer = ThreadPoolExecutor(
@@ -194,10 +203,17 @@ class SignalCapturer:
                 self._hook_named(layer, "mlp.act_fn", SIG_GATE, idx, missing)
             if want_qk:
                 rotary = _resolve(layer, "self_attn.rotary_emb")
-                if rotary is None:
-                    missing.add("qcur/kcur")
-                else:
+                if rotary is not None:
                     self._hook(rotary, self._make_qk_hook(idx))
+                # Some architectures (Qwen3-Next among them) apply RoPE with a
+                # fused kernel that reads rotary_emb's cache without calling the
+                # module, so the hook above never fires. Tap the fused QKV
+                # projection too and split it if nothing post-RoPE arrives.
+                qkv = _resolve(layer, "self_attn.qkv_proj")
+                if qkv is not None and self._can_split_qkv:
+                    self._hook(qkv, self._make_simple_hook(_SIG_QKV, idx))
+                elif rotary is None:
+                    missing.add("qcur/kcur")
 
         if missing:
             logger.warning(
@@ -217,6 +233,18 @@ class SignalCapturer:
             missing.add(signal)
             return
         self._hook(module, self._make_simple_hook(signal, idx))
+
+    @property
+    def _can_split_qkv(self) -> bool:
+        return self.head_dim > 0 and self.num_heads > 0 and self.num_kv_heads > 0
+
+    def _split_qkv(self, rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """[rows, (n_head + 2*n_kv) * head_dim] -> (queries, keys)."""
+        q_width = self.num_heads * self.head_dim
+        kv_width = self.num_kv_heads * self.head_dim
+        if rows.shape[-1] != q_width + 2 * kv_width:
+            raise ValueError("qkv width does not match the model's head geometry")
+        return rows[:, :q_width], rows[:, q_width : q_width + kv_width]
 
     def _make_residual_hook(self, layer_idx: int):
         def hook(_module, _args, output):
@@ -266,6 +294,8 @@ class SignalCapturer:
         if index is None or tensor.ndim < 2:
             return
         if mode_for(self.tier, signal) is Mode.DROP:
+            return
+        if layer_idx not in self.tapped_layers:
             return
         flat = tensor.reshape(tensor.shape[0], -1)
         if flat.shape[0] < self._num_tokens:
@@ -372,9 +402,58 @@ class SignalCapturer:
             self._row_index = None
             self._row_req_ids = []
 
+    def _warn_on_silent_signals(self) -> None:
+        """Say so when a tier asks for a signal no tap produced.
+
+        Without this a fused kernel or an unusual layer layout just yields a
+        deposit that is quietly missing a column.
+        """
+        if self._silent_checked:
+            return
+        self._silent_checked = True
+        wanted = {
+            signal
+            for signal in ALL_SIGNALS
+            if mode_for(self.tier, signal) is not Mode.DROP
+        }
+        silent = sorted(wanted - set(self._staged))
+        if silent:
+            logger.warning(
+                "Signal capture: tier %s asks for %s, but no tap on this "
+                "architecture produced them; they will be absent from deposits.",
+                self.tier.wire_name,
+                ", ".join(silent),
+            )
+
     def _drain_signals(self, row_req_ids: list[str], tokens: list[int]) -> None:
         raw_mode = {sig: mode_for(self.tier, sig) is Mode.RAW for sig in self._staged}
         host: dict[str, tuple[list[int], torch.Tensor]] = {}
+
+        fused = self._staged.pop(_SIG_QKV, None)
+        if fused and SIG_QCUR not in self._staged:
+            # Nothing post-RoPE arrived; fall back to the projection output.
+            try:
+                for layer_idx, rows in fused.items():
+                    query, key = self._split_qkv(rows)
+                    self._staged[SIG_QCUR][layer_idx] = query
+                    self._staged[SIG_KCUR][layer_idx] = key
+                if self.rope_phase != "pre":
+                    self.rope_phase = "pre"
+                    logger.warning_once(
+                        "Signal capture: this architecture applies RoPE with a "
+                        "fused kernel, so post-RoPE Q/K are not observable. "
+                        "Recording pre-RoPE qcur/kcur from qkv_proj instead; "
+                        "deposits are marked rope_phase=pre."
+                    )
+            except ValueError:
+                logger.warning_once(
+                    "Signal capture: could not split this model's fused QKV "
+                    "projection; qcur/kcur will be absent."
+                )
+                self._staged.pop(SIG_QCUR, None)
+                self._staged.pop(SIG_KCUR, None)
+
+        self._warn_on_silent_signals()
 
         # ALL_SIGNALS order puts qcur before kcur, which the Q-K cosine needs.
         for signal in [s for s in ALL_SIGNALS if s in self._staged]:
@@ -451,6 +530,7 @@ class SignalCapturer:
                 session=self.config.session,
                 max_bytes=self.config.max_bytes,
                 token_reduce=self._token_reduce,
+                rope_phase=self.rope_phase,
             )
             self._deposits[request_id] = deposit
         return deposit
@@ -481,6 +561,7 @@ class SignalCapturer:
                     f"{requested.wire_name}."
                 )
             self.tier = requested
+            self._silent_checked = False
             logger.info("Signal capture tier set to %s", requested.wire_name)
 
         if tokens is not None:
@@ -493,13 +574,20 @@ class SignalCapturer:
             logger.info("Signal capture token reduction set to %s", tokens)
 
         if layers is not None:
-            selected = set(self.config.resolve_layers(len(self.layers)))
+            from dataclasses import replace
+
+            selected = set(
+                replace(self.config, layers=layers).resolve_layers(len(self.layers))
+            )
             unavailable = selected - self._hooked_layers
             if unavailable:
                 raise ValueError(
                     f"layers {sorted(unavailable)} were not tapped at startup; "
-                    "only the layers selected then can be recorded."
+                    f"only {sorted(self._hooked_layers)} can be recorded. Restart "
+                    "with a wider --signal-capture-layers."
                 )
+            self.tapped_layers = selected
+            logger.info("Signal capture layers set to %s", sorted(selected))
 
         return self.status()
 
@@ -510,7 +598,8 @@ class SignalCapturer:
             "tier": self.tier.wire_name,
             "max_tier": self.max_tier.wire_name,
             "tokens": self._token_reduce,
-            "tapped_layers": sorted(self._hooked_layers),
+            "layers": sorted(self.tapped_layers),
+            "hooked_layers": sorted(self._hooked_layers),
             "num_layers": len(self.layers),
             "output_dir": self.config.output_dir,
             "open_deposits": len(self._deposits),
@@ -541,8 +630,14 @@ class SignalCapturer:
             self._token_counter.pop(rid, None)
             if deposit is None or deposit.is_empty:
                 continue
+            # Timestamp first so the directory reads as a history in sort
+            # order, and so a reused request id never overwrites an earlier
+            # turn. The id stays in the name, and in the metadata.
+            stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime(deposit.created_at))
+            millis = int(deposit.created_at * 1000) % 1000
             path = os.path.join(
-                self.config.output_dir, f"{_safe_name(rid)}.safetensors"
+                self.config.output_dir,
+                f"{stamp}.{millis:03d}-{_safe_name(rid)}.safetensors",
             )
             self._writer.submit(self._write, deposit, path)
 
@@ -638,10 +733,23 @@ def maybe_build_capturer(vllm_config, model: nn.Module) -> "SignalCapturer | Non
         pass
 
     model_config = vllm_config.model_config
-    head_dim = getattr(model_config, "get_head_size", lambda: 0)() or 0
+    head_dim = num_heads = num_kv_heads = 0
+    if model_config is not None:
+        parallel_config = vllm_config.parallel_config
+        try:
+            head_dim = model_config.get_head_size()
+            num_heads = model_config.get_num_attention_heads(parallel_config)
+            num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        except Exception:
+            # Head geometry is only needed to split a fused QKV projection;
+            # without it that fallback is simply unavailable.
+            logger.debug("Signal capture: head geometry unavailable", exc_info=True)
+
     return SignalCapturer(
         SignalCaptureConfig.from_observability(observability),
         model,
         model_name=model_config.model if model_config is not None else "",
         head_dim=head_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
     )

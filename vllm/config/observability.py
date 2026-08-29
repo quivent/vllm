@@ -77,7 +77,7 @@ class ObservabilityConfig:
     - `off`: no capture (default).
     - `logit`: per-token entropy / perplexity / confidence.
     - `layer_stats`: the above plus per-layer scalar reductions of every signal.
-    - `heads`: per-head scalar reductions.
+    - `heads`: per-head scalar reductions. Not implemented; rejected.
     - `residual_raw`: the full residual stream (`l_out`) vector per layer, raw.
     - `full_raw`: the above plus gate / norms / q / k vectors per layer.
     - `full_raw_attn`: the above plus attention weights (not supported behind a
@@ -255,6 +255,13 @@ class ObservabilityConfig:
         from vllm.signals.tiers import Tier, tier_from_str
 
         tier = tier_from_str(value)
+        if tier == Tier.HEADS:
+            raise ValueError(
+                "signal capture tier 'heads' (T3) is not implemented: the "
+                "per-head reduction is a stub in the reference recorder too, "
+                "and would silently record the same scalars as 'layer_stats'. "
+                "Use 'layer_stats' (T2) for per-layer scalars."
+            )
         if tier == Tier.FULL_RAW_ATTN:
             raise ValueError(
                 "signal_capture_tier='full_raw_attn' (T6) records post-softmax "

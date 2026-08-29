@@ -1312,7 +1312,11 @@ class VllmConfig:
         if self.observability_config.signal_capture_enabled:
             from vllm.signals.tiers import Tier, tier_from_str
 
-            tier = tier_from_str(self.observability_config.signal_capture_tier)
+            observability = self.observability_config
+            tier = tier_from_str(
+                observability.signal_capture_max_tier
+                or observability.signal_capture_tier
+            )
             if (
                 tier >= Tier.LAYER_STATS
                 and self.model_config is not None

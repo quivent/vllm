@@ -669,6 +669,9 @@ class EngineArgs:
     )
     cudagraph_metrics: bool = ObservabilityConfig.cudagraph_metrics
     signal_capture_tier: str = ObservabilityConfig.signal_capture_tier
+    signal_capture_max_tier: str | None = (
+        ObservabilityConfig.signal_capture_max_tier
+    )
     signal_capture_dir: str | None = ObservabilityConfig.signal_capture_dir
     signal_capture_layers: str = ObservabilityConfig.signal_capture_layers
     signal_capture_layer_step: int = get_field(
@@ -676,6 +679,9 @@ class EngineArgs:
     )
     signal_capture_token_step: int = get_field(
         ObservabilityConfig, "signal_capture_token_step"
+    )
+    signal_capture_tokens: Literal["last", "first", "mean", "all"] = (
+        ObservabilityConfig.signal_capture_tokens
     )
     signal_capture_dtype: Literal["native", "float32"] = (
         ObservabilityConfig.signal_capture_dtype
@@ -1527,6 +1533,10 @@ class EngineArgs:
             **observability_kwargs["signal_capture_tier"],
         )
         observability_group.add_argument(
+            "--signal-capture-max-tier",
+            **observability_kwargs["signal_capture_max_tier"],
+        )
+        observability_group.add_argument(
             "--signal-capture-dir", **observability_kwargs["signal_capture_dir"]
         )
         observability_group.add_argument(
@@ -1540,6 +1550,10 @@ class EngineArgs:
         observability_group.add_argument(
             "--signal-capture-token-step",
             **observability_kwargs["signal_capture_token_step"],
+        )
+        observability_group.add_argument(
+            "--signal-capture-tokens",
+            **observability_kwargs["signal_capture_tokens"],
         )
         observability_group.add_argument(
             "--signal-capture-dtype",
@@ -2005,10 +2019,12 @@ class EngineArgs:
             kv_cache_metrics_sample=self.kv_cache_metrics_sample,
             cudagraph_metrics=self.cudagraph_metrics,
             signal_capture_tier=self.signal_capture_tier,
+            signal_capture_max_tier=self.signal_capture_max_tier,
             signal_capture_dir=self.signal_capture_dir,
             signal_capture_layers=self.signal_capture_layers,
             signal_capture_layer_step=self.signal_capture_layer_step,
             signal_capture_token_step=self.signal_capture_token_step,
+            signal_capture_tokens=self.signal_capture_tokens,
             signal_capture_dtype=self.signal_capture_dtype,
             signal_capture_max_bytes=self.signal_capture_max_bytes,
             signal_capture_session=self.signal_capture_session,

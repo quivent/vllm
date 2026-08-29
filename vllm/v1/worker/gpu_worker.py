@@ -1426,6 +1426,23 @@ class Worker(WorkerBase):
         if not self._weight_update_is_draft:
             self.model_runner.reset_lora_state()
 
+    def set_signal_capture(
+        self,
+        tier: str | None = None,
+        tokens: str | None = None,
+        layers: str | None = None,
+    ) -> dict | None:
+        """Change inference-signal capture at runtime. See `/signals/control`."""
+        capturer = getattr(self.model_runner, "signal_capturer", None)
+        if capturer is None:
+            return None
+        return capturer.set_runtime(tier=tier, tokens=tokens, layers=layers)
+
+    def get_signal_capture_status(self) -> dict | None:
+        """Report what signal capture is doing on this worker."""
+        capturer = getattr(self.model_runner, "signal_capturer", None)
+        return None if capturer is None else capturer.status()
+
     def shutdown(self) -> None:
         gc.unfreeze()
 

@@ -127,7 +127,9 @@ def test_finds_decoder_stack():
 
 
 def test_residual_raw_deposit_is_one_vector_per_token(tmp_path):
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    config = SignalCaptureConfig(
+        tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path)
+    )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake", head_dim=HEAD_DIM)
 
@@ -152,7 +154,7 @@ def test_residual_raw_deposit_is_one_vector_per_token(tmp_path):
 
 def test_residual_raw_all_layers(tmp_path):
     config = SignalCaptureConfig(
-        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), layers="all"
+        tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), layers="all"
     )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake", head_dim=HEAD_DIM)
@@ -177,7 +179,7 @@ def test_native_dtype_halves_the_deposit(tmp_path):
     for dtype in ("native", "float32"):
         out = tmp_path / dtype
         config = SignalCaptureConfig(
-            tier=Tier.RESIDUAL_RAW, output_dir=str(out), dtype=dtype
+            tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(out), dtype=dtype
         )
         model = FakeModel().to(torch.bfloat16)
         capturer = SignalCapturer(config, model, model_name="fake")
@@ -197,7 +199,7 @@ def test_native_dtype_halves_the_deposit(tmp_path):
 
 def test_full_raw_captures_every_forward_signal(tmp_path):
     config = SignalCaptureConfig(
-        tier=Tier.FULL_RAW, output_dir=str(tmp_path), layers="all"
+        tokens="all", tier=Tier.FULL_RAW, output_dir=str(tmp_path), layers="all"
     )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake", head_dim=HEAD_DIM)
@@ -217,7 +219,7 @@ def test_full_raw_captures_every_forward_signal(tmp_path):
 
 def test_layer_stats_tier_writes_scalar_tuples(tmp_path):
     config = SignalCaptureConfig(
-        tier=Tier.LAYER_STATS, output_dir=str(tmp_path), layers="all"
+        tokens="all", tier=Tier.LAYER_STATS, output_dir=str(tmp_path), layers="all"
     )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake", head_dim=HEAD_DIM)
@@ -235,7 +237,7 @@ def test_layer_stats_tier_writes_scalar_tuples(tmp_path):
 
 def test_token_step_thins_the_capture(tmp_path):
     config = SignalCaptureConfig(
-        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), token_step=3
+        tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), token_step=3
     )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake")
@@ -249,7 +251,10 @@ def test_token_step_thins_the_capture(tmp_path):
 
 def test_max_bytes_truncates_rather_than_growing(tmp_path):
     config = SignalCaptureConfig(
-        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), max_bytes=HIDDEN * 4 * 3
+        tokens="all",
+        tier=Tier.RESIDUAL_RAW,
+        output_dir=str(tmp_path),
+        max_bytes=HIDDEN * 4 * 3,
     )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake")
@@ -263,7 +268,9 @@ def test_max_bytes_truncates_rather_than_growing(tmp_path):
 
 
 def test_two_requests_get_separate_deposits(tmp_path):
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    config = SignalCaptureConfig(
+        tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path)
+    )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake")
     run_steps(capturer, model, ["alpha", "beta"], n_steps=4)
@@ -280,7 +287,9 @@ def test_two_requests_get_separate_deposits(tmp_path):
 
 def test_hooks_are_inert_outside_a_step(tmp_path):
     """A dummy/profile run between steps must not land in any deposit."""
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    config = SignalCaptureConfig(
+        tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path)
+    )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake")
 
@@ -304,7 +313,7 @@ def test_hooks_are_inert_outside_a_step(tmp_path):
     ],
 )
 def test_layer_selector(spec, expected):
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, layers=spec)
+    config = SignalCaptureConfig(tokens="all", tier=Tier.RESIDUAL_RAW, layers=spec)
     assert config.resolve_layers(N_LAYERS) == expected
 
 
@@ -321,7 +330,7 @@ def test_residual_matches_vllms_own_aux_hidden_state():
     hidden, residual = torch.randn(4, HIDDEN), torch.randn(4, HIDDEN)
     (expected,) = mixin._maybe_add_hidden_state([], 1, hidden, residual)
 
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir="")
+    config = SignalCaptureConfig(tokens="all", tier=Tier.RESIDUAL_RAW, output_dir="")
     capturer = SignalCapturer(config, FakeModel())
     captured = {}
     capturer._stage = lambda signal, idx, tensor: captured.setdefault(signal, tensor)
@@ -333,7 +342,7 @@ def test_residual_matches_vllms_own_aux_hidden_state():
 
 def test_residual_tap_handles_a_layer_without_a_fused_residual():
     """Models whose layers return a bare tensor still record the stream."""
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir="")
+    config = SignalCaptureConfig(tokens="all", tier=Tier.RESIDUAL_RAW, output_dir="")
     capturer = SignalCapturer(config, FakeModel())
     captured = {}
     capturer._stage = lambda signal, idx, tensor: captured.setdefault(signal, tensor)
@@ -372,7 +381,9 @@ def test_spec_decode_rows_map_to_the_right_requests():
 
 def test_mismatched_row_mapping_skips_the_step(tmp_path, caplog):
     """Rather than misattribute activations, capture nothing for that step."""
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    config = SignalCaptureConfig(
+        tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path)
+    )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake")
 
@@ -393,7 +404,9 @@ def test_shutdown_flushes_requests_that_never_got_a_final_step(tmp_path):
     arrives on a *subsequent* step. Requests that finish last never see one, so
     shutdown is their only flush.
     """
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    config = SignalCaptureConfig(
+        tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path)
+    )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake")
 
@@ -408,7 +421,9 @@ def test_shutdown_flushes_requests_that_never_got_a_final_step(tmp_path):
 
 def test_shutdown_is_idempotent(tmp_path):
     """The exit backstop may fire after an explicit shutdown; that must be safe."""
-    config = SignalCaptureConfig(tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path))
+    config = SignalCaptureConfig(
+        tokens="all", tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path)
+    )
     model = FakeModel()
     capturer = SignalCapturer(config, model, model_name="fake")
     run_steps(capturer, model, ["r"], n_steps=2)
@@ -418,3 +433,168 @@ def test_shutdown_is_idempotent(tmp_path):
 
     _, header = read_deposit(tmp_path / "r.safetensors")
     assert header["residual"]["shape"] == [2, HIDDEN]
+
+
+# ── per-turn reduction: one residual for the whole generation ────────────────
+
+
+def _turn_deposit(tmp_path, tokens, n_steps=5, layers="last"):
+    config = SignalCaptureConfig(
+        tier=Tier.RESIDUAL_RAW,
+        output_dir=str(tmp_path),
+        tokens=tokens,
+        layers=layers,
+    )
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+    run_steps(capturer, model, ["turn"], n_steps=n_steps)
+    capturer.shutdown()
+    return read_deposit(tmp_path / "turn.safetensors")
+
+
+@pytest.mark.parametrize("tokens", ["last", "first", "mean"])
+def test_a_turn_is_one_vector_regardless_of_response_length(tmp_path, tokens):
+    metadata, header = _turn_deposit(tmp_path, tokens, n_steps=40)
+    assert header["residual"]["shape"] == [1, HIDDEN]
+    assert metadata["token_reduce"] == tokens
+    assert metadata["num_tokens"] == "40"
+
+
+def test_deposit_size_is_flat_in_response_length(tmp_path):
+    """The point of a per-turn deposit: 10 tokens and 200 tokens cost the same."""
+    short = _turn_deposit(tmp_path / "a", "last", n_steps=10)[1]
+    long = _turn_deposit(tmp_path / "b", "last", n_steps=200)[1]
+    assert short["residual"]["shape"] == long["residual"]["shape"] == [1, HIDDEN]
+
+
+def test_last_keeps_the_final_token(tmp_path):
+    metadata, header = _turn_deposit(tmp_path, "last", n_steps=6)
+    from safetensors.torch import load_file
+
+    index = load_file(tmp_path / "turn.safetensors")["residual.index"]
+    assert index[0, 0].item() == 5  # tokens 0..5, the last one
+
+
+def test_first_keeps_the_opening_token(tmp_path):
+    _turn_deposit(tmp_path, "first", n_steps=6)
+    from safetensors.torch import load_file
+
+    index = load_file(tmp_path / "turn.safetensors")["residual.index"]
+    assert index[0, 0].item() == 0
+
+
+def test_mean_averages_the_turn(tmp_path):
+    """The stored vector is the mean of what the hook saw, not a sampled token."""
+    config = SignalCaptureConfig(
+        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), tokens="mean"
+    )
+    model = FakeModel()
+    capturer = SignalCapturer(config, model, model_name="fake")
+
+    seen = []
+    original = capturer._stage
+
+    def record(signal, layer_idx, tensor):
+        original(signal, layer_idx, tensor)
+        if signal == "residual" and capturer._active:
+            seen.append(capturer._staged[signal][layer_idx].clone())
+
+    capturer._stage = record
+    run_steps(capturer, model, ["turn"], n_steps=4)
+    capturer.shutdown()
+
+    from safetensors.torch import load_file
+
+    stored = load_file(tmp_path / "turn.safetensors")["residual"].float()
+    torch.testing.assert_close(stored, torch.cat(seen).mean(0, keepdim=True))
+
+
+def test_per_turn_with_all_layers_is_one_vector_per_layer(tmp_path):
+    _, header = _turn_deposit(tmp_path, "last", n_steps=12, layers="all")
+    assert header["residual"]["shape"] == [N_LAYERS, HIDDEN]
+
+
+# ── runtime control: change what is recorded without a restart ───────────────
+
+
+def _runtime_capturer(tmp_path, tier=Tier.OFF, max_tier=Tier.FULL_RAW):
+    config = SignalCaptureConfig(
+        tier=tier, max_tier=max_tier, output_dir=str(tmp_path), layers="all"
+    )
+    model = FakeModel()
+    return SignalCapturer(config, model, model_name="fake", head_dim=HEAD_DIM), model
+
+
+def test_hooks_install_for_the_ceiling_not_the_active_tier(tmp_path):
+    """Launching at `off` still installs hooks, so capture can be switched on."""
+    capturer, _ = _runtime_capturer(tmp_path, tier=Tier.OFF, max_tier=Tier.FULL_RAW)
+    assert capturer.enabled
+    assert capturer._handles, "no hooks installed"
+    assert capturer.status()["recording"] is False
+
+
+def test_off_tier_records_nothing_then_switching_on_records(tmp_path):
+    capturer, model = _runtime_capturer(tmp_path, tier=Tier.OFF)
+
+    run_steps(capturer, model, ["r"], n_steps=3)
+    assert capturer._deposits == {}, "recorded while tier was off"
+
+    capturer.set_runtime(tier="residual_raw", tokens="all")
+    run_steps(capturer, model, ["r"], n_steps=4)
+    capturer.shutdown()
+
+    _, header = read_deposit(tmp_path / "r.safetensors")
+    assert header["residual"]["shape"] == [4 * N_LAYERS, HIDDEN]
+
+
+def test_switching_off_again_stops_recording(tmp_path):
+    capturer, model = _runtime_capturer(tmp_path, tier=Tier.RESIDUAL_RAW)
+    capturer.set_runtime(tokens="all")
+
+    run_steps(capturer, model, ["r"], n_steps=2)
+    capturer.set_runtime(tier="off")
+    run_steps(capturer, model, ["r"], n_steps=10)
+    capturer.shutdown()
+
+    _, header = read_deposit(tmp_path / "r.safetensors")
+    assert header["residual"]["shape"] == [2 * N_LAYERS, HIDDEN]
+
+
+def test_tier_above_the_ceiling_is_refused(tmp_path):
+    capturer, _ = _runtime_capturer(tmp_path, max_tier=Tier.RESIDUAL_RAW)
+    with pytest.raises(ValueError, match="above this process's ceiling"):
+        capturer.set_runtime(tier="full_raw")
+    assert capturer.status()["tier"] == "off"
+
+
+def test_runtime_tier_change_swaps_which_signals_are_recorded(tmp_path):
+    capturer, model = _runtime_capturer(tmp_path, tier=Tier.RESIDUAL_RAW)
+    capturer.set_runtime(tokens="all")
+    run_steps(capturer, model, ["r"], n_steps=1)
+
+    capturer.set_runtime(tier="full_raw")
+    run_steps(capturer, model, ["r"], n_steps=1)
+    capturer.shutdown()
+
+    _, header = read_deposit(tmp_path / "r.safetensors")
+    # residual spans both steps; the rest only appear after the tier went up.
+    assert header["residual"]["shape"][0] == 2 * N_LAYERS
+    assert header["gate"]["shape"][0] == 1 * N_LAYERS
+    assert header["qcur"]["shape"][0] == 1 * N_LAYERS
+
+
+def test_bad_runtime_values_are_refused(tmp_path):
+    capturer, _ = _runtime_capturer(tmp_path)
+    with pytest.raises(ValueError, match="Unknown capture tier"):
+        capturer.set_runtime(tier="turbo")
+    with pytest.raises(ValueError, match="unknown token reduction"):
+        capturer.set_runtime(tokens="median")
+
+
+def test_status_reports_the_live_configuration(tmp_path):
+    capturer, _ = _runtime_capturer(tmp_path, tier=Tier.LOGIT, max_tier=Tier.FULL_RAW)
+    status = capturer.status()
+    assert status["tier"] == "logit"
+    assert status["max_tier"] == "full_raw"
+    assert status["num_layers"] == N_LAYERS
+    assert status["tapped_layers"] == list(range(N_LAYERS))

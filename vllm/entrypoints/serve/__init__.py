@@ -50,6 +50,10 @@ def register_vllm_dev_api_routers(app: FastAPI):
 
     attach_cache_router(app)
 
+    from .dev.signals.api_router import attach_router as attach_signals_router
+
+    attach_signals_router(app)
+
     from .dev.rlhf.api_router import attach_router as attach_rlhf_router
 
     attach_rlhf_router(app)

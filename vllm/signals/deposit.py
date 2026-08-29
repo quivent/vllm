@@ -25,7 +25,6 @@ pass. Pass ``dtype="float32"`` for byte-identical output.
 
 import os
 import time
-from dataclasses import dataclass, field
 
 import torch
 from safetensors.torch import save_file
@@ -38,33 +37,100 @@ logger = init_logger(__name__)
 DEPOSIT_FORMAT = "sigcap-v1"
 
 
-@dataclass
 class _Buffer:
-    """Accumulated rows for one signal, in capture order."""
+    """Rows for one signal, reduced over the turn's tokens as configured.
 
-    chunks: list[torch.Tensor] = field(default_factory=list)
-    tokens: list[int] = field(default_factory=list)
-    layers: list[int] = field(default_factory=list)
-    width: int = 0
-    nbytes: int = 0
+    ``all`` keeps every captured token. The other modes keep one row per layer
+    for the whole generation, which is what makes a per-turn deposit a fixed
+    size no matter how long the response runs.
+    """
+
+    def __init__(self, reduce: str = "all"):
+        self.reduce = reduce
+        self.width = 0
+        self.nbytes = 0
+        # reduce == "all"
+        self.chunks: list[torch.Tensor] = []
+        self.tokens: list[int] = []
+        self.layers: list[int] = []
+        # reduce in ("first", "last"): layer -> (row, token)
+        self._single: dict[int, tuple[torch.Tensor, int]] = {}
+        # reduce == "mean": layer -> [running sum (f32), count, first token]
+        self._sums: dict[int, list] = {}
 
     def append(self, rows: torch.Tensor, token: int, layer: int) -> int:
-        """Append ``rows`` ([n, width]); returns the bytes added."""
+        """Take ``rows`` ([n, width]); returns the change in buffered bytes."""
         if self.width == 0:
             self.width = rows.shape[-1]
         elif rows.shape[-1] != self.width:
             # Ragged guard, matching the C++ recorder: silently skip.
             return 0
-        self.chunks.append(rows)
-        n = rows.shape[0]
-        self.tokens.extend([token] * n)
-        self.layers.extend([layer] * n)
-        added = rows.numel() * rows.element_size()
-        self.nbytes += added
-        return added
+
+        row_bytes = rows.numel() * rows.element_size()
+
+        if self.reduce == "all":
+            self.chunks.append(rows)
+            n = rows.shape[0]
+            self.tokens.extend([token] * n)
+            self.layers.extend([layer] * n)
+            self.nbytes += row_bytes
+            return row_bytes
+
+        if self.reduce == "first":
+            if layer in self._single:
+                return 0
+            self._single[layer] = (rows, token)
+            self.nbytes += row_bytes
+            return row_bytes
+
+        if self.reduce == "last":
+            # Replaces in place, so a long generation costs no more than a
+            # short one. Only the final token survives to the deposit.
+            added = 0 if layer in self._single else row_bytes
+            self._single[layer] = (rows, token)
+            self.nbytes += added
+            return added
+
+        # mean: accumulate in float32, cast back at build time.
+        entry = self._sums.get(layer)
+        if entry is None:
+            self._sums[layer] = [rows.float(), 1, token, rows.dtype]
+            self.nbytes += rows.numel() * 4
+            return rows.numel() * 4
+        entry[0] += rows.float()
+        entry[1] += 1
+        return 0
 
     def stack(self) -> torch.Tensor:
-        return torch.cat(self.chunks, dim=0)
+        if self.reduce == "all":
+            return torch.cat(self.chunks, dim=0)
+        if self.reduce == "mean":
+            return torch.cat(
+                [
+                    (self._sums[layer][0] / self._sums[layer][1]).to(
+                        self._sums[layer][3]
+                    )
+                    for layer in sorted(self._sums)
+                ],
+                dim=0,
+            )
+        return torch.cat(
+            [self._single[layer][0] for layer in sorted(self._single)], dim=0
+        )
+
+    def index_pairs(self) -> tuple[list[int], list[int]]:
+        """The (token, layer) coordinate of each row, in stored order."""
+        if self.reduce == "all":
+            return self.tokens, self.layers
+        if self.reduce == "mean":
+            layers = sorted(self._sums)
+            return [self._sums[i][2] for i in layers], layers
+        layers = sorted(self._single)
+        return [self._single[i][1] for i in layers], layers
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.chunks or self._single or self._sums)
 
 
 class Deposit:
@@ -86,8 +152,10 @@ class Deposit:
         model: str = "",
         session: str = "",
         max_bytes: int = 0,
+        token_reduce: str = "all",
     ):
         self.request_id = request_id
+        self.token_reduce = token_reduce
         self.tier = tier
         self.layer_step = layer_step
         self.token_step = token_step
@@ -132,7 +200,7 @@ class Deposit:
         incoming = rows.numel() * rows.element_size()
         if not self._budget_left(incoming):
             return
-        buffer = self._raw.setdefault(signal, _Buffer())
+        buffer = self._raw.setdefault(signal, _Buffer(self.token_reduce))
         self.nbytes += buffer.append(rows, token, layer)
 
     def add_stats(
@@ -141,9 +209,9 @@ class Deposit:
         incoming = rows.numel() * rows.element_size()
         if not self._budget_left(incoming):
             return
-        self.nbytes += self._stats.setdefault(signal, _Buffer()).append(
-            rows, token, layer
-        )
+        self.nbytes += self._stats.setdefault(
+            signal, _Buffer(self.token_reduce)
+        ).append(rows, token, layer)
 
     def add_logits(self, rows: torch.Tensor, token: int) -> None:
         incoming = rows.numel() * rows.element_size()
@@ -157,7 +225,7 @@ class Deposit:
         self.num_tokens += 1
 
     @staticmethod
-    def _index(tokens: list[int], layers: list[int] | None) -> torch.Tensor:
+    def _index(tokens: list[int], layers: list[int] | None = None) -> torch.Tensor:
         """(token, layer) pairs as f32 -- exact for these ranges, and portable."""
         if layers is None:
             return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
@@ -168,10 +236,10 @@ class Deposit:
         tensors: dict[str, torch.Tensor] = {}
         for name, buf in sorted(self._raw.items()):
             tensors[name] = buf.stack()
-            tensors[f"{name}.index"] = self._index(buf.tokens, buf.layers)
+            tensors[f"{name}.index"] = self._index(*buf.index_pairs())
         for name, buf in sorted(self._stats.items()):
             tensors[f"stats.{name}"] = buf.stack()
-            tensors[f"stats.{name}.index"] = self._index(buf.tokens, buf.layers)
+            tensors[f"stats.{name}.index"] = self._index(*buf.index_pairs())
         if self._logit_rows:
             tensors["logit"] = torch.cat(self._logit_rows, dim=0)
             tensors["logit.index"] = self._index(self._logit_tokens, None)
@@ -183,6 +251,7 @@ class Deposit:
             "tier": self.tier.wire_name,
             "layer_step": str(self.layer_step),
             "token_step": str(self.token_step),
+            "token_reduce": self.token_reduce,
             "model": self.model,
             "session": self.session,
             "request_id": self.request_id,

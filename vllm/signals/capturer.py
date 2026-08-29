@@ -55,6 +55,7 @@ from vllm.signals.tiers import (
     Mode,
     Tier,
     mode_for,
+    tier_from_str,
 )
 
 logger = init_logger(__name__)
@@ -114,6 +115,7 @@ class SignalCapturer:
         self.model_name = model_name
         self.head_dim = head_dim
         self.tier = config.tier
+        self.max_tier = config.max_tier
 
         self.layers = find_decoder_layers(model)
         if not self.layers:
@@ -125,6 +127,8 @@ class SignalCapturer:
             return
 
         self.tapped_layers = set(config.resolve_layers(len(self.layers)))
+        self._hooked_layers = set(self.tapped_layers)
+        self._token_reduce = config.tokens
         self.enabled = bool(self.tapped_layers)
 
         self._deposits: dict[str, Deposit] = {}
@@ -164,7 +168,8 @@ class SignalCapturer:
     # ── hook installation ────────────────────────────────────────────────────
 
     def _wants(self, signal: str) -> bool:
-        return mode_for(self.tier, signal) is not Mode.DROP
+        """Hook installation is decided by the ceiling, not the live tier."""
+        return mode_for(self.max_tier, signal) is not Mode.DROP
 
     def _install_hooks(self) -> None:
         want_residual = self._wants(SIG_RESIDUAL)
@@ -259,6 +264,8 @@ class SignalCapturer:
         index = self._row_index
         if index is None or tensor.ndim < 2:
             return
+        if mode_for(self.tier, signal) is Mode.DROP:
+            return
         flat = tensor.reshape(tensor.shape[0], -1)
         if flat.shape[0] < self._num_tokens:
             # Not a per-token activation of this batch (or a dummy run slipping
@@ -278,7 +285,7 @@ class SignalCapturer:
             num_tokens: rows in this batch's token dimension, used to tell
                 per-token activations apart from other tensors the hooks see.
         """
-        if not self.enabled or not row_req_ids:
+        if not self.enabled or not row_req_ids or self.tier == Tier.OFF:
             self._active = False
             return
         if len(row_req_ids) != row_index.shape[0]:
@@ -432,9 +439,72 @@ class SignalCapturer:
                 model=self.model_name,
                 session=self.config.session,
                 max_bytes=self.config.max_bytes,
+                token_reduce=self._token_reduce,
             )
             self._deposits[request_id] = deposit
         return deposit
+
+    def set_runtime(
+        self,
+        tier: str | None = None,
+        tokens: str | None = None,
+        layers: str | None = None,
+    ) -> dict:
+        """Change what is recorded, without a restart.
+
+        Only what the hooks already produce can be recorded, so ``tier`` is
+        clamped to the ceiling chosen at startup. Layer selection is likewise
+        limited to the layers that were tapped. Returns the new status.
+
+        Raises:
+            ValueError: if ``tier`` exceeds the startup ceiling, or a value is
+                not a known tier/reduction.
+        """
+        if tier is not None:
+            requested = tier_from_str(tier)
+            if requested > self.max_tier:
+                raise ValueError(
+                    f"tier {requested.wire_name!r} is above this process's "
+                    f"ceiling {self.max_tier.wire_name!r}; the hooks for it were "
+                    "never installed. Restart with --signal-capture-max-tier "
+                    f"{requested.wire_name}."
+                )
+            self.tier = requested
+            logger.info("Signal capture tier set to %s", requested.wire_name)
+
+        if tokens is not None:
+            if tokens not in ("all", "first", "last", "mean"):
+                raise ValueError(
+                    f"unknown token reduction {tokens!r}; expected one of "
+                    "all, first, last, mean"
+                )
+            self._token_reduce = tokens
+            logger.info("Signal capture token reduction set to %s", tokens)
+
+        if layers is not None:
+            selected = set(self.config.resolve_layers(len(self.layers)))
+            unavailable = selected - self._hooked_layers
+            if unavailable:
+                raise ValueError(
+                    f"layers {sorted(unavailable)} were not tapped at startup; "
+                    "only the layers selected then can be recorded."
+                )
+
+        return self.status()
+
+    def status(self) -> dict:
+        """What capture is doing right now."""
+        return {
+            "enabled": self.enabled,
+            "tier": self.tier.wire_name,
+            "max_tier": self.max_tier.wire_name,
+            "tokens": self._token_reduce,
+            "tapped_layers": sorted(self._hooked_layers),
+            "num_layers": len(self.layers),
+            "output_dir": self.config.output_dir,
+            "open_deposits": len(self._deposits),
+            "recording": self.tier != Tier.OFF and self.enabled,
+        }
 
     def _register_exit_flush(self) -> None:
         """Last-resort flush, in case the runner is torn down without shutdown().

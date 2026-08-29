@@ -87,6 +87,20 @@ class ObservabilityConfig:
     forward hooks, which forces eager execution -- see `--enforce-eager`.
     Requires `--signal-capture-dir`."""
 
+    signal_capture_max_tier: str | None = None
+    """Highest tier this process may switch to at runtime. Defaults to
+    `--signal-capture-tier`.
+
+    The tier decides what gets *recorded*; this decides which forward hooks get
+    *installed* at load time, and so whether eager execution is forced. Set this
+    above `--signal-capture-tier` to keep capture switchable without a restart:
+
+        --signal-capture-max-tier full_raw --signal-capture-tier off
+
+    starts recording nothing (a boolean check per layer) but lets
+    `POST /signals/control` raise the tier later. Because hooks force eager,
+    this trades throughput for the ability to turn capture on in place."""
+
     signal_capture_dir: str | None = None
     """Directory to write signal deposits into, one `<request_id>.safetensors`
     per generation. Capture is inactive unless this is set."""
@@ -104,6 +118,17 @@ class ObservabilityConfig:
     signal_capture_token_step: int = Field(default=1, ge=1)
     """Record every Nth generated token of each request."""
 
+    signal_capture_tokens: Literal["last", "first", "mean", "all"] = "last"
+    """How to reduce a turn's generated tokens into a deposit.
+
+    - `last`: one vector per tapped layer, from the turn's final token. This is
+      the default, and makes a turn cost one hidden-size vector no matter how
+      long the response runs.
+    - `first`: the state at the first generated token.
+    - `mean`: averaged over every generated token of the turn.
+    - `all`: every generated token, one row each. Grows with response length,
+      so pair it with `--signal-capture-token-step`."""
+
     signal_capture_dtype: Literal["native", "float32"] = "native"
     """Storage dtype for raw vectors. `native` keeps the model's activation
     dtype, so values are stored exactly as they exist in the forward pass;
@@ -118,9 +143,16 @@ class ObservabilityConfig:
     """Free-form session label written into deposit metadata, for grouping the
     deposits of one experiment."""
 
-    @cached_property
+    @property
+    def signal_capture_effective_tier(self) -> str:
+        """The tier that determines hook installation: the ceiling if set."""
+        return self.signal_capture_max_tier or self.signal_capture_tier
+
+    @property
     def signal_capture_enabled(self) -> bool:
-        return self.signal_capture_tier != "off" and bool(self.signal_capture_dir)
+        return self.signal_capture_effective_tier != "off" and bool(
+            self.signal_capture_dir
+        )
 
     enable_layerwise_nvtx_tracing: bool = False
     """Enable layerwise NVTX tracing. This traces the execution of each layer or
@@ -215,9 +247,11 @@ class ObservabilityConfig:
             value = cast(list[DetailedTraceModules], value[0].split(","))
         return value
 
-    @field_validator("signal_capture_tier")
+    @field_validator("signal_capture_tier", "signal_capture_max_tier")
     @classmethod
-    def _validate_signal_capture_tier(cls, value: str) -> str:
+    def _validate_signal_capture_tier(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         from vllm.signals.tiers import Tier, tier_from_str
 
         tier = tier_from_str(value)
@@ -234,12 +268,18 @@ class ObservabilityConfig:
     def _validate_signal_capture(self):
         from vllm.signals.tiers import Tier, tier_from_str
 
-        if tier_from_str(self.signal_capture_tier) != Tier.OFF and not (
-            self.signal_capture_dir
-        ):
+        effective = tier_from_str(self.signal_capture_effective_tier)
+        if effective != Tier.OFF and not self.signal_capture_dir:
             raise ValueError(
-                "signal_capture_tier is set but --signal-capture-dir is not; "
+                "signal capture is configured but --signal-capture-dir is not; "
                 "there is nowhere to write deposits."
+            )
+        if tier_from_str(self.signal_capture_tier) > effective:
+            raise ValueError(
+                f"--signal-capture-tier {self.signal_capture_tier!r} is above "
+                f"--signal-capture-max-tier {self.signal_capture_max_tier!r}; the "
+                "ceiling decides which hooks get installed, so the starting tier "
+                "cannot exceed it."
             )
         return self
 

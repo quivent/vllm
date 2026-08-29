@@ -978,3 +978,113 @@ def test_a_built_vector_is_injectable(tmp_path):
     model(torch.randn(1, HIDDEN))
     capturer.end_step()
     assert capturer.injector.status()["applied"] == 1
+
+
+# ── graph backend: residual as a model output, no hooks, no eager ────────────
+
+
+class Eagle3Model(FakeModel):
+    """A model exposing vLLM's EAGLE-3 interface, as the graph backend needs."""
+
+    supports_eagle3 = True
+    has_own_lm_head = False
+    has_own_embed_tokens = False
+
+    def __init__(self):
+        super().__init__()
+        self.aux_layers: tuple[int, ...] = ()
+
+    def set_aux_hidden_state_layers(self, layers):
+        self.aux_layers = layers
+
+    def get_eagle3_default_aux_hidden_state_layers(self):
+        return (1,)
+
+
+def _graph_capturer(tmp_path, layers="last"):
+    config = SignalCaptureConfig(
+        tier=Tier.RESIDUAL_RAW,
+        output_dir=str(tmp_path),
+        backend="graph",
+        layers=layers,
+        tokens="all",
+    )
+    model = Eagle3Model()
+    return SignalCapturer(config, model, model_name="fake", hidden_size=HIDDEN), model
+
+
+def test_graph_backend_installs_no_hooks(tmp_path):
+    capturer, _ = _graph_capturer(tmp_path)
+    assert capturer.backend == "graph"
+    assert capturer._handles == []
+    assert not capturer.config.needs_hooks
+
+
+def test_graph_aux_indices_shift_by_one(tmp_path):
+    """`_maybe_add_hidden_state` numbers 0 for embeddings, i+1 after layer i."""
+    capturer, _ = _graph_capturer(tmp_path, layers="all")
+    assert capturer.graph_aux_layers() == tuple(range(1, N_LAYERS + 1))
+    capturer2, _ = _graph_capturer(tmp_path / "b", layers="0,3")
+    assert capturer2.graph_aux_layers() == (1, 4)
+
+
+def test_graph_backend_records_the_models_aux_output(tmp_path):
+    capturer, model = _graph_capturer(tmp_path, layers="all")
+    capturer.check_graph_backend(model, speculative_uses_aux=False)
+
+    for _ in range(2):
+        capturer.begin_step(["r"], torch.arange(1), 1)
+        # Stand in for what the model returns alongside its hidden states.
+        capturer.observe_aux([torch.randn(1, HIDDEN) for _ in range(N_LAYERS)])
+        capturer.end_step()
+    capturer.shutdown()
+
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
+    assert header["residual"]["shape"] == [2 * N_LAYERS, HIDDEN]
+
+
+def test_graph_backend_refuses_signals_it_cannot_reach(tmp_path):
+    config = SignalCaptureConfig(
+        tier=Tier.FULL_RAW, output_dir=str(tmp_path), backend="graph"
+    )
+    model = Eagle3Model()
+    capturer = SignalCapturer(config, model, hidden_size=HIDDEN)
+    with pytest.raises(ValueError, match="can only capture the residual"):
+        capturer.check_graph_backend(model, speculative_uses_aux=False)
+
+
+def test_graph_backend_refuses_a_model_without_the_interface(tmp_path):
+    config = SignalCaptureConfig(
+        tier=Tier.RESIDUAL_RAW, output_dir=str(tmp_path), backend="graph"
+    )
+    model = FakeModel()  # no EAGLE-3 interface
+    capturer = SignalCapturer(config, model, hidden_size=HIDDEN)
+    with pytest.raises(ValueError, match="EAGLE-3 interface"):
+        capturer.check_graph_backend(model, speculative_uses_aux=False)
+
+
+def test_graph_backend_reads_a_drafters_layers_for_free(tmp_path):
+    """If a DFlash/EAGLE-3 drafter already publishes the layer, just read it."""
+    capturer, model = _graph_capturer(tmp_path, layers="2")
+    # The drafter publishes decoder layers 1 and 2 -> aux indices 2 and 3.
+    owns = capturer.check_graph_backend(
+        model, speculative_uses_aux=True, drafter_layers=(2, 3)
+    )
+    assert owns is False, "capture must not reconfigure the drafter's layers"
+
+    capturer.begin_step(["r"], torch.arange(1), 1)
+    capturer.observe_aux([torch.randn(1, HIDDEN), torch.randn(1, HIDDEN)])
+    capturer.end_step()
+    capturer.shutdown()
+
+    _, header = read_deposit(deposit_path(tmp_path, "r"))
+    # Only the requested layer is kept, not everything the drafter publishes.
+    assert header["residual"]["shape"] == [1, HIDDEN]
+
+
+def test_graph_backend_explains_itself_when_the_drafter_lacks_the_layer(tmp_path):
+    capturer, model = _graph_capturer(tmp_path, layers="0")
+    with pytest.raises(ValueError, match="publishes decoder layers \\[1, 2\\]"):
+        capturer.check_graph_backend(
+            model, speculative_uses_aux=True, drafter_layers=(2, 3)
+        )

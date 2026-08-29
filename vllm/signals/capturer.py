@@ -124,6 +124,7 @@ class SignalCapturer:
         self.num_kv_heads = num_kv_heads
         self.tier = config.tier
         self.max_tier = config.max_tier
+        self.backend = config.backend
 
         self.layers = find_decoder_layers(model)
         if not self.layers:
@@ -153,6 +154,7 @@ class SignalCapturer:
         self._num_tokens = 0
         self._staged_logits: torch.Tensor | None = None
         self._silent_checked = False
+        self._aux_layer_order: tuple[int, ...] = ()
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
 
         self._writer = ThreadPoolExecutor(
@@ -161,7 +163,8 @@ class SignalCapturer:
         self._lock = threading.Lock()
 
         if self.enabled:
-            self._install_hooks()
+            if self.backend == "hook":
+                self._install_hooks()
             self._register_exit_flush()
             logger.info(
                 "Signal capture active: tier=%s layers=%s (of %d) token_step=%d "
@@ -585,6 +588,7 @@ class SignalCapturer:
         """What capture is doing right now."""
         return {
             "enabled": self.enabled,
+            "backend": self.backend,
             "tier": self.tier.wire_name,
             "max_tier": self.max_tier.wire_name,
             "tokens": self._token_reduce,
@@ -595,6 +599,101 @@ class SignalCapturer:
             "open_deposits": len(self._deposits),
             "recording": self.tier != Tier.OFF and self.enabled,
         }
+
+    def graph_aux_layers(self) -> tuple[int, ...]:
+        """Aux indices to request from the model, for the graph backend.
+
+        `_maybe_add_hidden_state` numbers 0 for the embeddings and `i + 1` for
+        the stream leaving decoder layer `i`, so the tapped layers shift by one.
+        """
+        return tuple(sorted(i + 1 for i in self.tapped_layers))
+
+    def check_graph_backend(
+        self,
+        model: nn.Module,
+        speculative_uses_aux: bool,
+        drafter_layers: tuple[int, ...] = (),
+    ) -> bool:
+        """Decide whether the graph backend can work, and how.
+
+        Returns True when capture should set the auxiliary layers itself, and
+        False when a drafter already publishes everything wanted -- in which
+        case capture reads what is already there and leaves the drafter's
+        configuration untouched.
+
+        Raises:
+            ValueError: when the tier needs a signal only hooks can reach, the
+                model has no EAGLE-3 interface, or a drafter owns the auxiliary
+                hidden states and is not publishing the layers wanted.
+        """
+        from vllm.model_executor.models.interfaces import supports_eagle3
+
+        extra = [
+            signal
+            for signal in ALL_SIGNALS
+            if signal != SIG_RESIDUAL
+            and mode_for(self.max_tier, signal) is not Mode.DROP
+        ]
+        if extra:
+            raise ValueError(
+                f"--signal-capture-backend graph can only capture the residual, "
+                f"but tier {self.max_tier.wire_name!r} also wants "
+                f"{', '.join(extra)}. Use --signal-capture-backend hook, or a "
+                "tier of residual_raw or below."
+            )
+        if mode_for(self.max_tier, SIG_RESIDUAL) is Mode.STATS:
+            raise ValueError(
+                "--signal-capture-backend graph records raw residuals; tier "
+                f"{self.max_tier.wire_name!r} asks for scalar reductions. Use "
+                "residual_raw, or the hook backend."
+            )
+        if not supports_eagle3(model):
+            raise ValueError(
+                "--signal-capture-backend graph needs a model implementing the "
+                "EAGLE-3 interface (it reuses that mechanism's auxiliary hidden "
+                "states); this one does not. Use --signal-capture-backend hook."
+            )
+        if not speculative_uses_aux:
+            return True
+
+        # A drafter (EAGLE-3, DFlash, DSpark) already owns the auxiliary list
+        # and indexes into it positionally, so its layer set cannot be widened.
+        # It can still be *read*, if it happens to publish what capture wants.
+        wanted = set(self.graph_aux_layers())
+        published = set(drafter_layers)
+        if wanted <= published:
+            self._aux_layer_order = tuple(sorted(published))
+            logger.info(
+                "Signal capture: reading the residual out of the drafter's "
+                "existing auxiliary hidden states (layers %s), so capture costs "
+                "nothing and the drafter is untouched.",
+                sorted(i - 1 for i in published),
+            )
+            return False
+        raise ValueError(
+            "--signal-capture-backend graph cannot widen the auxiliary hidden "
+            "states while a drafter owns them. That drafter publishes decoder "
+            f"layers {sorted(i - 1 for i in published)}; capture wants "
+            f"{sorted(i - 1 for i in wanted)}. Either capture one of the layers "
+            "it already publishes (--signal-capture-layers "
+            f"{','.join(str(i - 1) for i in sorted(published))}), or use "
+            "--signal-capture-backend hook."
+        )
+
+    def observe_aux(self, aux_hidden_states) -> None:
+        """Take the residuals the model returned, in graph-backend mode.
+
+        The list is in the order of :meth:`graph_aux_layers`, and every entry is
+        an ordinary graph output, so nothing here has to be capture-safe.
+        """
+        if not self._active or self.backend != "graph" or not aux_hidden_states:
+            return
+        order = self._aux_layer_order or self.graph_aux_layers()
+        for layer_idx, stream in zip(order, aux_hidden_states):
+            # Back to decoder-layer numbering for the deposit.
+            decoder_layer = layer_idx - 1
+            if decoder_layer in self.tapped_layers:
+                self._stage(SIG_RESIDUAL, decoder_layer, stream)
 
     def set_injection(self, spec: InjectionSpec | None) -> dict:
         """Install or clear a residual injection, hooking the target layer.

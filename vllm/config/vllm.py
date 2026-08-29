@@ -1320,8 +1320,12 @@ class VllmConfig:
                 observability.signal_capture_max_tier
                 or observability.signal_capture_tier
             )
-            needs_hooks = tier >= Tier.LAYER_STATS or bool(
-                observability.signal_inject_from
+            # The graph backend reads residuals as model outputs, so it needs
+            # no hooks and keeps CUDA graphs. Injection always rewrites a layer
+            # output, which a graph would bake in, so it always needs eager.
+            needs_hooks = bool(observability.signal_inject_from) or (
+                tier >= Tier.LAYER_STATS
+                and observability.signal_capture_backend == "hook"
             )
             if (
                 needs_hooks

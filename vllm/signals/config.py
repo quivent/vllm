@@ -26,6 +26,10 @@ class SignalCaptureConfig:
     forced. Launch with ``max_tier`` high and ``tier`` off to pay only a boolean
     check per layer until you switch capture on."""
 
+    backend: str = "hook"
+    """`hook` (any signal, forces eager) or `graph` (residual only, keeps CUDA
+    graphs by reusing vLLM's EAGLE-3 auxiliary hidden states)."""
+
     output_dir: str = ""
     layer_step: int = 1
     token_step: int = 1
@@ -58,7 +62,7 @@ class SignalCaptureConfig:
     @property
     def needs_hooks(self) -> bool:
         """Whether capture requires module forward hooks (and therefore eager)."""
-        return self.max_tier >= Tier.LAYER_STATS
+        return self.backend == "hook" and self.max_tier >= Tier.LAYER_STATS
 
     def resolve_layers(self, num_layers: int) -> tuple[int, ...]:
         """Expand the ``layers`` selector against the model's layer count."""
@@ -84,6 +88,7 @@ class SignalCaptureConfig:
     def from_observability(cls, obs) -> "SignalCaptureConfig":
         """Build from an :class:`~vllm.config.ObservabilityConfig`."""
         return cls(
+            backend=obs.signal_capture_backend,
             tier=tier_from_str(obs.signal_capture_tier),
             max_tier=tier_from_str(
                 obs.signal_capture_max_tier or obs.signal_capture_tier

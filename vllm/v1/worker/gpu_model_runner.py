@@ -4535,6 +4535,10 @@ class GPUModelRunner(
                 **model_kwargs,
             )
             if self.signal_capturer is not None:
+                if self.signal_capturer.backend == "graph" and isinstance(
+                    model_output, tuple
+                ):
+                    self.signal_capturer.observe_aux(model_output[1])
                 self.signal_capturer.disarm()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
@@ -5450,6 +5454,17 @@ class GPUModelRunner(
                 self.signal_capturer = maybe_build_capturer(
                     self.vllm_config, self.model
                 )
+                if (
+                    self.signal_capturer is not None
+                    and self.signal_capturer.backend == "graph"
+                ):
+                    self.signal_capturer.check_graph_backend(
+                        self.get_model(), self.use_aux_hidden_state_outputs
+                    )
+                    self.model.set_aux_hidden_state_layers(
+                        self.signal_capturer.graph_aux_layers()
+                    )
+                    self.use_aux_hidden_state_outputs = True
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the

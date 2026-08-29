@@ -392,6 +392,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
             self.signal_capturer = maybe_build_capturer(self.vllm_config, self.model)
+            if (
+                self.signal_capturer is not None
+                and self.signal_capturer.backend == "graph"
+            ):
+                # Reuse EAGLE-3's auxiliary hidden states as the residual tap:
+                # the model returns them as ordinary graph outputs, so CUDA
+                # graphs stay on and no hook is needed.
+                self.signal_capturer.check_graph_backend(
+                    self.model, self.use_aux_hidden_state_outputs
+                )
+                self.model.set_aux_hidden_state_layers(
+                    self.signal_capturer.graph_aux_layers()
+                )
+                self.use_aux_hidden_state_outputs = True
+
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
@@ -1784,6 +1799,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         if self.signal_capturer is not None:
+            if self.signal_capturer.backend == "graph" and self.is_last_pp_rank:
+                model_out = model_output
+                if isinstance(model_out, tuple) and len(model_out) == 2:
+                    self.signal_capturer.observe_aux(model_out[1])
             self.signal_capturer.disarm()
 
         if self.is_last_pp_rank:

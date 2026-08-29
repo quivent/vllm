@@ -672,6 +672,9 @@ class EngineArgs:
     signal_capture_max_tier: str | None = (
         ObservabilityConfig.signal_capture_max_tier
     )
+    signal_capture_backend: Literal["hook", "graph"] = (
+        ObservabilityConfig.signal_capture_backend
+    )
     signal_capture_dir: str | None = ObservabilityConfig.signal_capture_dir
     signal_capture_layers: str = ObservabilityConfig.signal_capture_layers
     signal_capture_layer_step: int = get_field(
@@ -1546,6 +1549,10 @@ class EngineArgs:
             **observability_kwargs["signal_capture_max_tier"],
         )
         observability_group.add_argument(
+            "--signal-capture-backend",
+            **observability_kwargs["signal_capture_backend"],
+        )
+        observability_group.add_argument(
             "--signal-capture-dir", **observability_kwargs["signal_capture_dir"]
         )
         observability_group.add_argument(
@@ -2049,6 +2056,7 @@ class EngineArgs:
             cudagraph_metrics=self.cudagraph_metrics,
             signal_capture_tier=self.signal_capture_tier,
             signal_capture_max_tier=self.signal_capture_max_tier,
+            signal_capture_backend=self.signal_capture_backend,
             signal_capture_dir=self.signal_capture_dir,
             signal_capture_layers=self.signal_capture_layers,
             signal_capture_layer_step=self.signal_capture_layer_step,

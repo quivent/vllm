@@ -101,6 +101,21 @@ class ObservabilityConfig:
     `POST /signals/control` raise the tier later. Because hooks force eager,
     this trades throughput for the ability to turn capture on in place."""
 
+    signal_capture_backend: Literal["hook", "graph"] = "hook"
+    """How the residual is read out of the forward pass.
+
+    - `hook`: module forward hooks. Works on any architecture and can reach
+      every signal, but hooks do not run on CUDA graph replay, so this forces
+      eager execution -- roughly a 4x throughput cost on a speculative-decoding
+      setup.
+    - `graph`: reuses vLLM's EAGLE-3 auxiliary hidden states, which the model
+      returns as ordinary graph outputs. CUDA graphs stay on, so there is no
+      throughput cost, but it can only capture `residual` and needs a model
+      implementing `SupportsEagle3`. Rejected at load if either does not hold,
+      rather than quietly recording nothing.
+
+    Use `graph` in front of traffic; `hook` when you need the other signals."""
+
     signal_capture_dir: str | None = None
     """Directory to write signal deposits into, one `<request_id>.safetensors`
     per generation. Capture is inactive unless this is set."""

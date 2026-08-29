@@ -105,13 +105,62 @@ uv pip install ninja >/dev/null 2>&1 || true   # flashinfer JITs at startup
 
 # ── 4. artifacts from R2 ─────────────────────────────────────────────────────
 say "artifacts from R2"
-gemstone r2 check --json >/dev/null || die "gemstone R2 credentials are not configured"
+# gemstone is the preferred path, but a bare box may only have the credentials
+# file, so fall back to boto3 against the R2 endpoint.
+if command -v gemstone >/dev/null && gemstone r2 check --json >/dev/null 2>&1; then
+  R2_MODE=gemstone
+elif [[ -f "$HOME/.council-r2.env" ]]; then
+  R2_MODE=s3
+  uv pip install boto3 >/dev/null 2>&1 || true
+else
+  die "no R2 access: install gemstone, or provide ~/.council-r2.env"
+fi
+echo "  using the $R2_MODE backend"
+
+r2_pull() {  # r2_pull <prefix> <dest>
+  local prefix="$1" dest="$2"
+  mkdir -p "$dest"
+  if [[ "$R2_MODE" == "gemstone" ]]; then
+    gemstone store pull "$prefix" "$dest"
+  else
+    "$REPO/.venv/bin/python" - "$prefix" "$dest" <<'PY'
+import os, sys, boto3
+prefix, dest = sys.argv[1], sys.argv[2]
+env = {}
+with open(os.path.expanduser("~/.council-r2.env")) as fh:
+    for line in fh:
+        line = line.strip().removeprefix("export ")
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            env[k.strip()] = v.strip().strip("'\"")
+s3 = boto3.client("s3", endpoint_url=env["COUNCIL_R2_ENDPOINT"],
+                  aws_access_key_id=env["COUNCIL_R2_ACCESS_KEY_ID"],
+                  aws_secret_access_key=env["COUNCIL_R2_SECRET_ACCESS_KEY"],
+                  region_name="auto")
+bucket = env["COUNCIL_R2_BUCKET"]
+n = 0
+for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+    for obj in page.get("Contents", []):
+        rel = obj["Key"][len(prefix):].lstrip("/")
+        if not rel:
+            continue
+        out = os.path.join(dest, rel)
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        if os.path.exists(out) and os.path.getsize(out) == obj["Size"]:
+            continue
+        s3.download_file(bucket, obj["Key"], out)
+        n += 1
+        print(f"    {rel} ({obj['Size']/1e6:.0f} MB)", flush=True)
+print(f"    {n} object(s) fetched")
+PY
+  fi
+}
 
 MODEL_DIR="$MODELS/RedHatAI/Qwen3.8-27B-INT4"
 if [[ ! -f "$MODEL_DIR/config.json" ]]; then
   echo "  pulling the model (~19 GB)"
   mkdir -p "$MODEL_DIR"
-  gemstone store pull models/RedHatAI/Qwen3.8-27B-INT4/ "$MODEL_DIR"
+  r2_pull models/RedHatAI/Qwen3.8-27B-INT4/ "$MODEL_DIR"
 else
   echo "  model already present"
 fi
@@ -120,14 +169,14 @@ fi
 # only costs a recompile, so a wrong or absent cache is never fatal.
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$HOME/.cache/vllm-signals}"
 mkdir -p "$VLLM_CACHE_ROOT"
-gemstone store pull "artifacts/vllm-compile-cache/$ARCH_TAG/" "$VLLM_CACHE_ROOT" 2>/dev/null \
+r2_pull "artifacts/vllm-compile-cache/$ARCH_TAG/" "$VLLM_CACHE_ROOT" 2>/dev/null \
   && echo "  compile cache restored ($ARCH_TAG)" \
   || echo "  no compile cache for $ARCH_TAG - first boot will compile (~35 s)"
 
 mkdir -p "$SIGNALS"
 if (( PULL_SIGNALS )); then
   echo "  pulling the signals corpus"
-  gemstone store pull signals/ "$SIGNALS/_r2" || true
+  r2_pull signals/ "$SIGNALS/_r2" || true
 fi
 
 # ── 5. serve ─────────────────────────────────────────────────────────────────

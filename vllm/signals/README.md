@@ -1,5 +1,9 @@
 # Inference-signal capture and injection
 
+> **Status, 2026-08-29 — graph backend + MTP speculative decoding: WORKING on
+> Qwen3.8-27B-INT4 (H200).** Residual captured with CUDA graphs on, eager not
+> forced, MTP untouched. Proof below.
+
 A private patch to vLLM that does two things:
 
 - **Capture** — write the residual stream out of a live forward pass, one file
@@ -229,10 +233,72 @@ Both write the same `sigcap-v1` shape capture produces, so the output goes
 straight into `--signal-inject-from`. `--normalize` scales to unit norm so
 `alpha` becomes the whole magnitude.
 
+## Verified configuration
+
+Qwen3.8-27B-INT4 on an H200 NVL, graph backend, MTP speculative decoding:
+
+```
+$ curl localhost:8001/signals/status
+{"enabled":true,"backend":"graph","tier":"residual_raw","max_tier":"residual_raw",
+ "tokens":"last","layers":[63],"num_layers":64,"recording":true}
+
+$ curl localhost:8001/server_info | grep -o "SpeculativeConfig(...)"
+SpeculativeConfig(method='mtp', num_spec_tokens=3, ...)
+
+grep -c "Cudagraph is disabled under eager mode"  ->  0
+Capturing CUDA graphs (PIECEWISE): 100%
+Capturing CUDA graphs (FULL):      100%
+```
+
+`python -m vllm.signals.bench --port 8001 --dir ~/signals`:
+
+```
+[  ok  ] patched vllm         /signals/status present
+[  ok  ] capture configured   backend=graph tier=residual_raw tokens=last
+[  ok  ] layers tapped        [63] of 64
+[  ok  ] recording            yes
+[  ok  ] cuda graphs          compiled
+[  ok  ] inference            64 tokens in 0.85s = 75.4 tok/s (single stream)
+[  ok  ] residual saved       [1, 5120] BF16 = 10,240 B (10.0 KiB)
+[  ok  ] deposit metadata     tier=residual_raw reduce=last positions=85
+[  ok  ] residual is real     L2 norm 349.9, all finite=True
+```
+
+Two things to read carefully in that output.
+
+**`positions=85` for 64 completion tokens.** That ratio is speculative decoding
+at work: MTP verifies draft positions, so capture sees more sampling positions
+than the request emitted tokens. It is the reason the metadata field is called
+`num_captured_positions` and not `num_tokens`.
+
+**The bench's own "speculative decoding: not enabled" is a false negative.** Its
+`/server_info` parser misses vLLM's `SpeculativeConfig(...)` repr; the config is
+there, confirmed directly above. The check needs fixing; the deployment does not.
+
+### Getting there took three fixes, each hidden behind the last
+
+`use_aux_hidden_state_outputs` is overloaded — three components read it and want
+different things:
+
+1. the runner's EAGLE-3 setup re-derived the auxiliary layers straight after
+   capture set them, silently replacing layer 63 with EAGLE-3's defaults;
+2. the **speculator** branches on that flag and takes the EAGLE-3 path, so MTP
+   died on `assert self.method == "eagle3"`;
+3. the **cudagraph manager** allocates output buffers with
+   `empty_like(model_output)` and only unpacks a tuple when *its* copy of the
+   flag is set, so it choked on the tuple capture had asked the model for.
+
+Capture now owns its own flag, tells the graph manager to expect the tuple, and
+leaves the speculator's view untouched.
+
 ## Costs
 
-**Capture above `logit` forces eager execution, and on this setup that costs
-about 4x throughput.** Forward hooks are captured into a CUDA graph and then
+**This applies to the `hook` backend only.** The `graph` backend keeps CUDA
+graphs and does not pay it — see the verified configuration above. Use `graph`
+unless you need a signal other than the residual.
+
+**The hook backend forces eager execution, and on this setup that costs about
+4x throughput.** Forward hooks are captured into a CUDA graph and then
 never re-run on replay, so deposits would silently go empty after warmup. The
 patch enables `enforce_eager` and says so in the log. Injection forces it too.
 

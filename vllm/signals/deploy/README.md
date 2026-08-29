@@ -92,13 +92,16 @@ long sequences, not shorter ones.
 | backend | throughput | works on Qwen3.5 today |
 |---|---|---|
 | `hook` | **~0.22x** — forces eager | yes |
-| `graph` | full speed, keeps CUDA graphs | **no, not yet** |
+| `graph` | full speed, keeps CUDA graphs | **yes, verified with MTP** |
 
-The `graph` backend is the right answer and is not finished: on
-`Qwen3_5ForConditionalGeneration` the auxiliary hidden states are accepted but
-the model still returns a bare tensor. Deploy with `hook` and treat capture as a
-window, or leave `--signal-capture-tier off` with no ceiling for full-speed
-serving.
+Deploy with `graph`: verified on Qwen3.8-27B-INT4 with MTP on an H200, CUDA
+graphs on and eager not forced. `hook` is the fallback for signals other than
+the residual, and costs ~4x.
+
+One environment note from that box: flashinfer JIT-compiles its sampler through
+nvcc into the host gcc, which failed with `cannot execute 'cc1plus'` even after
+installing g++. `VLLM_USE_FLASHINFER_SAMPLER=0` sidesteps it and is set in the
+launcher; the sampler is not what capture touches.
 
 Measured on the GH200 (48 prompts, concurrency 8, 256 in / 128 out, MTP 3):
 

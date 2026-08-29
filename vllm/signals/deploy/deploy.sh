@@ -42,6 +42,9 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$GPU" ]] || { echo "--gpu is required" >&2; usage; exit 2; }
 
+# ~/.local/bin holds uv and gemstone; a non-login shell will not have it.
+export PATH="$HOME/.local/bin:$PATH"
+
 say() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mfatal:\033[0m %s\n' "$*" >&2; exit 1; }
 

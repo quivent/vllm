@@ -165,9 +165,11 @@ class ObservabilityConfig:
     signal_inject_alpha: float = 1.0
     """Scale on the injected vector."""
 
-    signal_inject_mode: Literal["add", "replace"] = "add"
+    signal_inject_mode: Literal["add", "replace", "state"] = "add"
     """`add` steers (`stream += alpha * v`); `replace` sets the stream to the
-    captured state, so generation continues from it."""
+    captured state at one layer; `state` sets it at every layer, so the
+    position's whole KV cache derives from the captured state and later tokens
+    attend to it instead of to what the prompt computed."""
 
     signal_inject_positions: Literal["first", "all"] = "first"
     """`first` seeds only each request's first sampled position -- the

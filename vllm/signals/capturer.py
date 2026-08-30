@@ -157,7 +157,7 @@ class SignalCapturer:
         self._hooked_layers = set(self.tapped_layers)
         self._token_reduce = config.tokens
         self.injector = SignalInjector(len(self.layers), hidden_size)
-        self._inject_handle = None
+        self._inject_handles: list = []
         self.enabled = bool(self.tapped_layers)
 
         self._deposits: dict[str, Deposit] = {}
@@ -741,19 +741,36 @@ class SignalCapturer:
                 self._stage(SIG_RESIDUAL, decoder_layer, stream)
 
     def set_injection(self, spec: InjectionSpec | None) -> dict:
-        """Install or clear a residual injection, hooking the target layer.
+        """Install or clear a residual injection, hooking the target layers.
 
-        The hook is registered on demand rather than planned at startup, so any
-        layer can be injected into regardless of which ones capture taps.
+        The hooks are registered on demand rather than planned at startup, so
+        any layer can be injected into regardless of which ones capture taps.
+
+        ``state`` hooks the whole stack. That is the point of it: a position's
+        K/V is computed, at each layer, from the stream that layer is handed,
+        so the cache only carries the injected state if every layer sees it.
+        Hooking one layer leaves the other 63 holding whatever the prompt
+        computed, which is the drift that made `replace` steering rather than
+        resumption.
         """
-        if self._inject_handle is not None:
-            self._inject_handle.remove()
-            self._inject_handle = None
+        for handle in self._inject_handles:
+            handle.remove()
+        self._inject_handles = []
         status = self.injector.set_spec(spec)
         if spec is not None:
-            layer = self.layers[spec.layer]
-            self._inject_handle = layer.register_forward_hook(
-                self._make_injection_hook(spec.layer)
+            targets = (
+                range(len(self.layers)) if spec.mode == "state" else [spec.layer]
+            )
+            for idx in targets:
+                self._inject_handles.append(
+                    self.layers[idx].register_forward_hook(
+                        self._make_injection_hook(idx)
+                    )
+                )
+            logger.info(
+                "Signal injection hooked %d layer(s) for mode=%s",
+                len(self._inject_handles),
+                spec.mode,
             )
         return status
 

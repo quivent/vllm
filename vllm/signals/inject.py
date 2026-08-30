@@ -15,10 +15,21 @@ Two modes, because they answer different questions:
     hard.
 
 ``replace``
-    ``stream = v``. The captured state *becomes* the state at that layer, so
-    generation continues from it rather than from what the prompt produced.
-    Blunt, and only meaningful if ``v`` came from the same layer of the same
-    model.
+    ``stream = v`` at one layer. The captured state becomes the state at *that
+    layer only*. Every layer below it still computed from the prompt, and the
+    KV cache for the position was written by that computation, so later tokens
+    attend to the original state and the generation drifts back. Steering, not
+    resumption - see ``state``.
+
+``state``
+    ``stream = v`` at *every* layer, for the seeded position. Because each
+    layer's attention computes that position's K/V from the stream it is
+    handed, writing the vector at every layer makes the whole KV cache for that
+    position derive from the captured state. Later tokens then attend to the
+    state rather than to whatever the prompt computed, which is what "start a
+    fresh discourse from this residual" actually requires. ``replace`` cannot
+    do this at any single layer, and at the last layer it does almost nothing:
+    63 of 64 layers still hold the prompt's K/V.
 
 Two position policies:
 
@@ -42,7 +53,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-INJECT_MODES = ("add", "replace")
+INJECT_MODES = ("add", "replace", "state")
 INJECT_POSITIONS = ("first", "all")
 
 
@@ -54,6 +65,8 @@ class InjectionSpec:
     """[hidden] the residual to inject."""
 
     layer: int
+    """Where to inject. Ignored by ``state``, which writes every layer."""
+
     alpha: float = 1.0
     mode: str = "add"
     positions: str = "first"
@@ -159,6 +172,8 @@ class SignalInjector:
         self._row_req_ids: list[str] = []
         self._active = False
         self.applied = 0
+        self._step_rows: torch.Tensor | None = None
+        self._step_rows_ready = False
 
     @property
     def enabled(self) -> bool:
@@ -200,11 +215,15 @@ class SignalInjector:
         self._row_req_ids = row_req_ids
         self._row_index = row_index
         self._active = True
+        self._step_rows = None
+        self._step_rows_ready = False
 
     def end_step(self) -> None:
         self._active = False
         self._row_index = None
         self._row_req_ids = []
+        self._step_rows = None
+        self._step_rows_ready = False
 
     def forget(self, request_ids) -> None:
         """Drop per-request seeding state when requests finish."""
@@ -212,7 +231,20 @@ class SignalInjector:
             self._seeded.discard(request_id)
 
     def _target_rows(self) -> torch.Tensor | None:
-        """Which of this step's sampling rows should be written."""
+        """Which of this step's sampling rows should be written.
+
+        Memoized for the step. ``state`` calls this once per layer and every
+        one of those calls must see the same rows; recomputing would mark the
+        request seeded on layer 0 and skip layers 1..N-1.
+        """
+        if self._step_rows_ready:
+            return self._step_rows
+        rows = self._compute_target_rows()
+        self._step_rows = rows
+        self._step_rows_ready = True
+        return rows
+
+    def _compute_target_rows(self) -> torch.Tensor | None:
         spec = self.spec
         if spec is None or self._row_index is None:
             return None
@@ -234,7 +266,10 @@ class SignalInjector:
         ``stream`` is [num_tokens, hidden]; only the sampling rows are touched.
         """
         spec = self.spec
-        if not self._active or spec is None or layer_idx != spec.layer:
+        if not self._active or spec is None:
+            return None
+        # `state` writes the whole stack; the others write one layer.
+        if spec.mode != "state" and layer_idx != spec.layer:
             return None
         rows = self._target_rows()
         if rows is None or rows.numel() == 0:
@@ -245,6 +280,8 @@ class SignalInjector:
         if spec.mode == "add":
             updated[rows] = updated[rows] + spec.alpha * vector
         else:
+            # replace and state both overwrite; they differ only in how many
+            # layers they are invoked for.
             updated[rows] = spec.alpha * vector
         self.applied += int(rows.numel())
         return updated

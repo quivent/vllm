@@ -696,7 +696,7 @@ class EngineArgs:
     signal_inject_from: str | None = ObservabilityConfig.signal_inject_from
     signal_inject_layer: int | None = ObservabilityConfig.signal_inject_layer
     signal_inject_alpha: float = ObservabilityConfig.signal_inject_alpha
-    signal_inject_mode: Literal["add", "replace"] = (
+    signal_inject_mode: Literal["add", "replace", "state"] = (
         ObservabilityConfig.signal_inject_mode
     )
     signal_inject_positions: Literal["first", "all"] = (

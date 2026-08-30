@@ -40,6 +40,20 @@ Two position policies:
 ``all``
     Every sampling position, so the influence persists for the whole turn.
 
+``zero``
+    Sequence position 0, during prefill - the first thing in the context,
+    *before* the prompt rather than after it.
+
+    This is a different kind of thing from the other two, which are both
+    sampling-row policies: they write where generation begins, which is the
+    *end* of the prompt. A vector written there is downstream of everything the
+    prompt already established, so it colours the next token and is then
+    outvoted by the context already built. Written at position 0 the prompt
+    itself is computed downstream of it, the model builds that position's K/V
+    at every layer the way it does for any token, and every later token attends
+    to it. What space the vector "came from" stops mattering, because 64 layers
+    of the model's own computation run on top of it.
+
 Injection rewrites a layer's output, which a CUDA graph would capture once and
 replay forever, so it forces eager execution the same way the hook-based
 capture tiers do.
@@ -54,7 +68,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 INJECT_MODES = ("add", "replace", "state")
-INJECT_POSITIONS = ("first", "all")
+INJECT_POSITIONS = ("first", "all", "zero")
 
 
 @dataclass
@@ -174,6 +188,7 @@ class SignalInjector:
         self.applied = 0
         self._step_rows: torch.Tensor | None = None
         self._step_rows_ready = False
+        self._num_tokens = 0
 
     @property
     def enabled(self) -> bool:
@@ -208,12 +223,18 @@ class SignalInjector:
             **({} if self.spec is None else self.spec.describe()),
         }
 
-    def begin_step(self, row_req_ids: list[str], row_index: torch.Tensor) -> None:
+    def begin_step(
+        self,
+        row_req_ids: list[str],
+        row_index: torch.Tensor,
+        num_tokens: int = 0,
+    ) -> None:
         if not self.enabled:
             self._active = False
             return
         self._row_req_ids = row_req_ids
         self._row_index = row_index
+        self._num_tokens = num_tokens
         self._active = True
         self._step_rows = None
         self._step_rows_ready = False
@@ -248,6 +269,16 @@ class SignalInjector:
         spec = self.spec
         if spec is None or self._row_index is None:
             return None
+        if spec.positions == "zero":
+            # Prefill only: a decode step's batch is one token per request and
+            # its row 0 is a *generated* position, not the context's start.
+            if self._num_tokens <= self._row_index.numel():
+                return None
+            unseeded = [rid for rid in self._row_req_ids if rid not in self._seeded]
+            if not unseeded:
+                return None
+            self._seeded.update(unseeded)
+            return torch.zeros(1, device=self._row_index.device, dtype=torch.long)
         if spec.positions == "all":
             return self._row_index
         wanted = [

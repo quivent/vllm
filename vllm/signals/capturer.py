@@ -347,11 +347,11 @@ class SignalCapturer:
         """
         if not row_req_ids:
             self._active = False
-            self.injector.begin_step([], row_index)
+            self.injector.begin_step([], row_index, num_tokens)
             return
         if not self.enabled or self.tier == Tier.OFF:
             self._active = False
-            self.injector.begin_step(row_req_ids, row_index.to(torch.long))
+            self.injector.begin_step(row_req_ids, row_index.to(torch.long), num_tokens)
             return
         if any(map(is_internal_request, row_req_ids)):
             keep = [
@@ -398,7 +398,7 @@ class SignalCapturer:
         self._row_index = row_index.to(torch.long)
         self._num_tokens = num_tokens
         self._active = True
-        self.injector.begin_step(row_req_ids, self._row_index)
+        self.injector.begin_step(row_req_ids, self._row_index, num_tokens)
 
     def disarm(self) -> None:
         """Stop the hooks staging, without draining yet.

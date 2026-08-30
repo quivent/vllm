@@ -1447,6 +1447,7 @@ class Worker(WorkerBase):
         positions: str = "first",
         signal: str = "residual",
         row: int = -1,
+        at: int | None = None,
     ) -> dict | None:
         """Install or clear a residual injection. See `/signals/inject`."""
         capturer = getattr(self.model_runner, "signal_capturer", None)
@@ -1461,6 +1462,7 @@ class Worker(WorkerBase):
             mode=mode,
             positions=positions,
             signal=signal,
+            at=at,
             row=row,
         )
 

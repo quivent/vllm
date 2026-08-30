@@ -783,12 +783,21 @@ class SignalCapturer:
         positions: str = "first",
         signal: str = "residual",
         row: int = -1,
+        at: int | None = None,
     ) -> dict:
         """Load a vector out of a deposit and install it as the injection.
 
-        ``layer`` defaults to the layer the vector was recorded at, which is
-        almost always what you want: a residual only means the same thing at
-        the depth it came from.
+        ``layer`` selects which recorded row to read, and defaults to the layer
+        the vector was recorded at.
+
+        ``at`` is where to *write* it, and defaults to the same place. They are
+        separate because the residual stream is one bus: layer 0's input and
+        layer 63's output are the same 5120-wide space, differing in what has
+        been accumulated onto it. So a state recorded at the top can be written
+        in near the bottom, and then every layer above computes that position's
+        K/V from it the way it would for any real token - in-distribution, by
+        the model itself, with no cache surgery. Writing a top-of-stack vector
+        into the middle of the stack instead is what is out of distribution.
         """
         from vllm.signals.inject import load_vector
 
@@ -800,6 +809,8 @@ class SignalCapturer:
                     f"{source} does not record which layer its {signal!r} came "
                     "from; pass an explicit layer."
                 )
+        if at is not None:
+            layer = at
         spec = InjectionSpec(
             vector=vector,
             layer=layer,

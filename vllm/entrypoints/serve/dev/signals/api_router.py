@@ -123,6 +123,7 @@ async def signals_inject(raw_request: Request):
             "mode": "add" | "replace",
             "positions": "first" | "all",
             "row": -1,
+            "at": 0,   # where to write it; defaults to `layer`
         }
 
     `add` steers along the captured direction; `replace` makes the captured
@@ -132,7 +133,9 @@ async def signals_inject(raw_request: Request):
     body = await raw_request.json() if await raw_request.body() else {}
     kwargs = {
         key: body[key]
-        for key in ("source", "layer", "alpha", "mode", "positions", "signal", "row")
+        for key in (
+            "source", "layer", "alpha", "mode", "positions", "signal", "row", "at",
+        )
         if key in body
     }
 

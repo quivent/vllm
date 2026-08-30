@@ -784,6 +784,7 @@ class SignalCapturer:
         signal: str = "residual",
         row: int = -1,
         at: int | None = None,
+        max_requests: int | None = None,
     ) -> dict:
         """Load a vector out of a deposit and install it as the injection.
 
@@ -818,6 +819,7 @@ class SignalCapturer:
             mode=mode,
             positions=positions,
             source=source,
+            max_requests=max_requests,
         )
         if (
             metadata.get("model")

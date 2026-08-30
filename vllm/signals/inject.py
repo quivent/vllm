@@ -85,6 +85,8 @@ class InjectionSpec:
     mode: str = "add"
     positions: str = "first"
     source: str = ""
+    max_requests: int | None = None
+    """Maximum distinct requests to seed; None keeps the injection mounted."""
 
     def validate(self, num_layers: int, hidden_size: int) -> None:
         if self.mode not in INJECT_MODES:
@@ -108,6 +110,8 @@ class InjectionSpec:
                 f"model's residual stream is {hidden_size} wide; the vector was "
                 "almost certainly captured from a different model"
             )
+        if self.max_requests is not None and self.max_requests < 1:
+            raise ValueError("max_requests must be at least 1 when set")
 
     def describe(self) -> dict:
         return {
@@ -117,6 +121,7 @@ class InjectionSpec:
             "positions": self.positions,
             "source": self.source,
             "hidden_size": int(self.vector.numel()),
+            "max_requests": self.max_requests,
         }
 
 
@@ -183,6 +188,7 @@ class SignalInjector:
         self.spec: InjectionSpec | None = None
         self._row_index: torch.Tensor | None = None
         self._seeded: set[str] = set()
+        self._consumed_requests: set[str] = set()
         self._row_req_ids: list[str] = []
         self._active = False
         self.applied = 0
@@ -200,6 +206,7 @@ class SignalInjector:
             spec.validate(self.num_layers, self.hidden_size)
         self.spec = spec
         self._seeded.clear()
+        self._consumed_requests.clear()
         self.applied = 0
         if spec is None:
             logger.info("Signal injection cleared")
@@ -220,6 +227,12 @@ class SignalInjector:
             "enabled": self.enabled,
             "applied": self.applied,
             "seeded_requests": len(self._seeded),
+            "consumed_requests": len(self._consumed_requests),
+            "exhausted": bool(
+                self.spec is not None
+                and self.spec.max_requests is not None
+                and len(self._consumed_requests) >= self.spec.max_requests
+            ),
             **({} if self.spec is None else self.spec.describe()),
         }
 
@@ -274,22 +287,35 @@ class SignalInjector:
             # its row 0 is a *generated* position, not the context's start.
             if self._num_tokens <= self._row_index.numel():
                 return None
-            unseeded = [rid for rid in self._row_req_ids if rid not in self._seeded]
+            unseeded = self._eligible_requests()
             if not unseeded:
                 return None
-            self._seeded.update(unseeded)
+            self._mark_seeded(unseeded[:1])
             return torch.zeros(1, device=self._row_index.device, dtype=torch.long)
         if spec.positions == "all":
             return self._row_index
-        wanted = [
-            i for i, rid in enumerate(self._row_req_ids) if rid not in self._seeded
-        ]
+        eligible = set(self._eligible_requests())
+        wanted = [i for i, rid in enumerate(self._row_req_ids) if rid in eligible]
         if not wanted:
             return None
-        for i in wanted:
-            self._seeded.add(self._row_req_ids[i])
+        self._mark_seeded([self._row_req_ids[i] for i in wanted])
         selector = torch.tensor(wanted, device=self._row_index.device, dtype=torch.long)
         return self._row_index.index_select(0, selector)
+
+    def _eligible_requests(self) -> list[str]:
+        """Unseeded request IDs, capped by the mount's remaining budget."""
+        spec = self.spec
+        candidates = [rid for rid in self._row_req_ids if rid not in self._seeded]
+        if spec is None or spec.max_requests is None:
+            return candidates
+        remaining = spec.max_requests - len(self._consumed_requests)
+        if remaining <= 0:
+            return []
+        return candidates[:remaining]
+
+    def _mark_seeded(self, request_ids: list[str]) -> None:
+        self._seeded.update(request_ids)
+        self._consumed_requests.update(request_ids)
 
     def apply(self, layer_idx: int, stream: torch.Tensor) -> torch.Tensor | None:
         """Rewrite the residual stream at ``layer_idx``, or None to leave it.

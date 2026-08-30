@@ -820,6 +820,28 @@ def test_first_seeds_each_request_once(tmp_path):
     assert capturer.injector.status()["applied"] == 2
 
 
+def test_injection_can_be_consumed_by_only_one_request(tmp_path):
+    source = _captured_vector(tmp_path, layer=1)
+    capturer, model = _injectable(tmp_path)
+    capturer.load_injection(
+        str(source), mode="state", positions="zero", max_requests=1
+    )
+
+    capturer.begin_step(["first"], torch.arange(1), 2)
+    model(torch.randn(2, HIDDEN))
+    capturer.end_step()
+    capturer.forget(["first"])
+
+    capturer.begin_step(["second"], torch.arange(1), 2)
+    model(torch.randn(2, HIDDEN))
+    capturer.end_step()
+
+    status = capturer.injector.status()
+    assert status["consumed_requests"] == 1
+    assert status["exhausted"] is True
+    assert status["max_requests"] == 1
+
+
 def test_all_positions_injects_every_step(tmp_path):
     source = _captured_vector(tmp_path, layer=1)
     capturer, model = _injectable(tmp_path)

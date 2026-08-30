@@ -124,6 +124,7 @@ async def signals_inject(raw_request: Request):
             "positions": "first" | "all",
             "row": -1,
             "at": 0,   # where to write it; defaults to `layer`
+            "max_requests": 1,  # optional one-shot request budget
         }
 
     `add` steers along the captured direction; `replace` makes the captured
@@ -135,6 +136,7 @@ async def signals_inject(raw_request: Request):
         key: body[key]
         for key in (
             "source", "layer", "alpha", "mode", "positions", "signal", "row", "at",
+            "max_requests",
         )
         if key in body
     }
